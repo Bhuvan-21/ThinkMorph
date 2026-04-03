@@ -258,7 +258,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                                 batch_data_indexes.append(sample['data_indexes'])
                                 break
                             else:
-                                print(f"skip a sample with length {num_tokens}")
+                                # print(f"skip a sample with length {num_tokens}")
                                 continue
 
             if sequence_status['curr'] < self.prefer_buffer_before and len(buffer) > 0:
@@ -278,14 +278,14 @@ class PackedDataset(torch.utils.data.IterableDataset):
             # if a sample is too long, skip it
             num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
             if num_tokens > self.max_num_tokens_per_sample:
-                print(f"skip a sample with length {num_tokens}")
+                # print(f"skip a sample with length {num_tokens}")
                 continue
 
             if sequence_status['curr'] + num_tokens > self.max_num_tokens:
                 if len(buffer) < self.max_buffer_size and not sample_from_buffer:
                     buffer.append(sample)
                 else:
-                    print(f"Yielding data with length {sum(sequence_status['sample_lens'])}")
+                    # print(f"Yielding data with length {sum(sequence_status['sample_lens'])}")
                     data = self.to_tensor(sequence_status)
                     data['batch_data_indexes'] = batch_data_indexes
                     yield data
