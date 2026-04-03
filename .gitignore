@@ -8,3 +8,8 @@ eval_results
 tests
 .DS_Store
 gradio.sh
+
+#mkodels
+BAGEL-7B-MoT/
+ThinkMorph-7B/
+siglip-so400m-14-980-flash-attn2-navit/
