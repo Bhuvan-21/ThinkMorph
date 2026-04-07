@@ -1,13 +1,20 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
+# Distributed settings
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"   # 1 = single GPU
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+
 # replace the variables with your own
 torchrun \
-  --nnodes=$num_nodes \
-  --node_rank=$node_rank \
-  --nproc_per_node=8 \
-  --master_addr=$master_addr \
-  --master_port=$master_port \
+  --nnodes=$NNODES \
+  --node_rank=$NODE_RANK \
+  --nproc_per_node=$NPROC_PER_NODE \
+  --master_addr=$MASTER_ADDR \
+  --master_port=$MASTER_PORT \
   train/pretrain_unified_navit.py \
   --dataset_config_file ./data/configs/interleaved_reasoning.yaml \
   --layer_module Qwen2MoTDecoderLayer \
