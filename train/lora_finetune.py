@@ -92,8 +92,8 @@ class DataArguments:
     dataset_config_file: str = field(default="data/configs/thinkmorph_reasoning.yaml")
     prefetch_factor: int = field(default=2)
     num_workers: int = field(default=4)
-    max_num_tokens_per_sample: int = field(default=4096)
-    max_num_tokens: int = field(default=4096)
+    max_num_tokens_per_sample: int = field(default=16384)
+    max_num_tokens: int = field(default=32768)
     prefer_buffer_before: int = field(default=4096)
     max_buffer_size: int = field(default=50)
     data_seed: int = field(default=42)
@@ -132,7 +132,7 @@ class TrainingArguments:
     mse_weight: float = field(default=1.0)
     ce_weight: float = field(default=1.0)
     ce_loss_reweighting: bool = field(default=False)
-    expected_num_tokens: int = field(default=8192)
+    expected_num_tokens: int = field(default=32768)
     gradient_checkpointing: bool = field(default=True)
 
 
@@ -229,7 +229,7 @@ def main():
             name=f"{training_args.wandb_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
             mode="offline" if training_args.wandb_offline else "online",
         )
-        wandb.config.update({**vars(model_args), **vars(training_args), **vars(data_args)}, allow_val_change=True)
+        wandb.config.update({**vars(model_args), **vars(training_args), **vars(data_args)})
 
     logger = create_logger(training_args.results_dir if rank == 0 else None, rank)
     dist.barrier()

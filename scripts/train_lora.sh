@@ -28,25 +28,25 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/lora}"
 CKPT_DIR="${CKPT_DIR:-results/lora/checkpoints}"
 RESUME_FROM="${RESUME_FROM:-}"
 
-WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora}"
+WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora-test}"
 WANDB_NAME="${WANDB_NAME:-interleaved-reasoning}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 # Training hyper-parameters
 TOTAL_STEPS="${TOTAL_STEPS:-8000}"
-WARMUP_STEPS="${WARMUP_STEPS:-100}"
-LR="${LR:-1e-5}"
+WARMUP_STEPS="${WARMUP_STEPS:-500}"
+LR="${LR:-1e-4}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 MSE_WEIGHT="${MSE_WEIGHT:-1.0}"
 CE_WEIGHT="${CE_WEIGHT:-1.0}"
-# Memory: tune for your GPU budget (8192 is safe for 1× A100 80 GB with grad ckpt)
+MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-8192}"
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-32768}"
-EXPECTED_NUM_TOKENS="${EXPECTED_NUM_TOKENS:-4096}"
+EXPECTED_NUM_TOKENS="${EXPECTED_NUM_TOKENS:-32768}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 
 # LoRA hyper-parameters
 LORA_R="${LORA_R:-32}"
-LORA_ALPHA="${LORA_ALPHA:-64}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 
@@ -82,6 +82,7 @@ torchrun \
   \
   --dataset_config_file "${DATASET_CONFIG}" \
   --num_workers 4 \
+  --max_num_tokens_per_sample "${MAX_NUM_TOKENS_PER_SAMPLE}" \
   --max_num_tokens "${MAX_NUM_TOKENS}" \
   --expected_num_tokens "${EXPECTED_NUM_TOKENS}" \
   \
@@ -97,9 +98,9 @@ torchrun \
   --lr_scheduler "${LR_SCHEDULER}" \
   --mse_weight "${MSE_WEIGHT}" \
   --ce_weight "${CE_WEIGHT}" \
-  --text_cond_dropout_prob 0.0 \
-  --vae_cond_dropout_prob 0.0 \
-  --vit_cond_dropout_prob 0.0 \
+  --text_cond_dropout_prob 0.1 \
+  --vae_cond_dropout_prob 0.3 \
+  --vit_cond_dropout_prob 0.3 \
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
   --log_every 10 \
   --save_every 500 \
