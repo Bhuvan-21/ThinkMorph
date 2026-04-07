@@ -22,10 +22,7 @@ Mapping → UnifiedEditIterableDataset parquet columns
   instruction_list  = [question]
   image_list        = [problem_image_0.bytes, reasoning_image_0.bytes]
   output_text_list  = [resoning_thought_0, resoning_thought_1]
-
-Training sequence per sample:
-  [INPUT image (no loss)] → [question (no loss)] →
-  [thought_0 (loss)] → [reasoning image (loss)] → [thought_1 (loss)]
+  answer            = answer (for reward calculation during GRPO training)
 """
 
 import argparse
@@ -53,6 +50,7 @@ PARQUET_SCHEMA = pa.schema([
     pa.field("instruction_list", pa.list_(pa.string())),
     pa.field("image_list",       pa.list_(pa.binary())),
     pa.field("output_text_list", pa.list_(pa.string())),
+    pa.field("answer",           pa.string()),
 ])
 
 
@@ -86,6 +84,7 @@ def convert_row(row):
     question  = str(row.get("question", "")).strip()
     thought_0 = str(row.get("resoning_thought_0", "")).strip()
     thought_1 = str(row.get("resoning_thought_1", "")).strip()
+    answer = str(row.get("answer", "")).strip()
 
     if not question or (not thought_0 and not thought_1):
         return None
@@ -94,6 +93,7 @@ def convert_row(row):
         "instruction_list": [question],
         "image_list":        [prob_bytes, reas_bytes],
         "output_text_list":  [thought_0, thought_1],
+        "answer":            answer,
     }
 
 
