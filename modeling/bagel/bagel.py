@@ -228,6 +228,113 @@ class Bagel(PreTrainedModel):
 
         return dict(mse=mse, ce=ce)
 
+    def compute_text_log_probs(
+        self,
+        sequence_length: int,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        sample_lens: List[int],
+        packed_position_ids: torch.LongTensor,
+        nested_attention_masks: List[torch.Tensor] = None,
+        split_lens: List[int] = None,
+        attn_modes: List[str] = None,
+        # for visual understanding
+        ce_loss_indexes: Optional[torch.BoolTensor] = None,
+        packed_label_ids: Optional[torch.LongTensor] = None,
+        packed_vit_tokens: Optional[torch.Tensor] = None,
+        packed_vit_token_indexes: Optional[torch.LongTensor] = None,
+        packed_vit_position_ids: Optional[torch.LongTensor] = None,
+        vit_token_seqlens: Optional[torch.IntTensor] = None,
+        # for visual generation (conditioning only — no MSE loss)
+        padded_latent: Optional[torch.Tensor] = None,
+        patchified_vae_latent_shapes: Optional[List[Tuple[int, int]]] = None,
+        packed_latent_position_ids: Optional[torch.LongTensor] = None,
+        packed_vae_token_indexes: Optional[torch.LongTensor] = None,
+        packed_timesteps: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-token log-probabilities for the text tokens at ce_loss_indexes.
+
+        Same forward path as forward(), but returns log π(a_t | s_t) instead of CE loss.
+        Used in GRPO policy update to get current / reference log-probs over
+        pre-generated sequences.
+
+        Returns:
+            log_probs: 1-D float tensor of shape (num_ce_tokens,), the log-prob
+            of each target token under the model.
+        """
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros(size=(sequence_length, self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        if nested_attention_masks is None:
+            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
+            seqlen = sum(sample_lens)
+            block_mask = create_block_mask(
+                sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen,
+                device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
+            )
+            attention_mask = block_mask
+        else:
+            attention_mask = nested_attention_masks
+
+        if self.config.visual_und and packed_vit_tokens is not None:
+            cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
+            cu_seqlens = cu_seqlens.to(torch.int32)
+            max_seqlen = torch.max(vit_token_seqlens).item()
+            packed_vit_token_embed = self.vit_model(
+                packed_pixel_values=packed_vit_tokens,
+                packed_flattened_position_ids=packed_vit_position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+            packed_vit_token_embed = self.connector(packed_vit_token_embed)
+            vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
+            packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
+            packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
+
+        if self.config.visual_gen and padded_latent is not None and packed_vae_token_indexes is not None:
+            p = self.latent_patch_size
+            packed_latent = []
+            for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
+                latent = latent[:, :h * p, :w * p].reshape(self.latent_channel, h, p, w, p)
+                latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+                packed_latent.append(latent)
+            packed_latent_clean = torch.cat(packed_latent, dim=0)
+
+            # Use clean latent (timestep=0) for conditioning context
+            packed_timestep_embeds = self.time_embedder(
+                torch.zeros(packed_latent_clean.shape[0], device=packed_latent_clean.device)
+            )
+            latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
+            packed_latent_embed = self.vae2llm(packed_latent_clean) + packed_timestep_embeds + latent_token_pos_emb
+            packed_sequence[packed_vae_token_indexes] = packed_latent_embed
+
+        extra_inputs = {}
+        if self.use_moe:
+            packed_und_token_indexes = packed_text_indexes
+            if packed_vit_token_indexes is not None:
+                packed_und_token_indexes = torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+            extra_inputs.update(
+                packed_und_token_indexes=packed_und_token_indexes,
+                packed_gen_token_indexes=packed_vae_token_indexes,
+            )
+
+        last_hidden_state = self.language_model(
+            packed_sequence=packed_sequence,
+            sample_lens=sample_lens,
+            attention_mask=attention_mask,
+            packed_position_ids=packed_position_ids,
+            **extra_inputs,
+        )
+
+        # Compute log-probs at the CE loss positions
+        logits = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
+        log_probs = F.log_softmax(logits, dim=-1)
+        # Gather log-prob of the actual target token
+        token_log_probs = log_probs.gather(1, packed_label_ids.unsqueeze(1)).squeeze(1)
+
+        return token_log_probs
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
         packed_text_ids = list()
@@ -938,9 +1045,11 @@ class Bagel(PreTrainedModel):
         do_sample: bool = False,
         temperature: float = 1.0,
         end_token_id: int = None,
+        return_log_probs: bool = False,
     ):
         step = 0
         generated_sequence = []
+        token_log_probs = [] if return_log_probs else None
         curr_tokens = packed_start_tokens
         while step < max_length:
             generated_sequence.append(curr_tokens)
@@ -983,6 +1092,11 @@ class Bagel(PreTrainedModel):
             else:
                 curr_tokens = torch.argmax(pred_logits, dim=-1)
 
+            if return_log_probs:
+                log_p = nn.functional.log_softmax(pred_logits, dim=-1)
+                selected_log_p = log_p.gather(1, curr_tokens.unsqueeze(1)).squeeze(1)
+                token_log_probs.append(selected_log_p)
+
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
                 uppacked[i] = torch.cat(
@@ -997,7 +1111,11 @@ class Bagel(PreTrainedModel):
                 break
 
         output_device = generated_sequence[0].device
-        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+        token_ids = torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+        if return_log_probs:
+            log_probs_tensor = torch.stack([lp.to(output_device) for lp in token_log_probs], dim=0)
+            return token_ids, log_probs_tensor
+        return token_ids
 
     # for evaluation
     @torch.no_grad()

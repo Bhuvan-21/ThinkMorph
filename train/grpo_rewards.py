@@ -16,8 +16,8 @@ def extract_answer(text: str) -> Optional[str]:
     matches = re.findall(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if matches:
         return matches[-1].strip()
-    """Check for: The answer is XX.  If so, extract XX."""
-    matches = re.findall(r"answer is\s*(.*)", text, re.IGNORECASE)
+    """Check for: The answer is XX (or is: XX).  If so, extract XX."""
+    matches = re.findall(r"answer is[:\s]+(.*?)(?:\s|\.|$)", text, re.IGNORECASE)
     if matches:
         return matches[-1].strip()
     return None
