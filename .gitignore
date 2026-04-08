@@ -13,3 +13,5 @@ gradio.sh
 BAGEL-7B-MoT/
 ThinkMorph-7B/
 siglip-so400m-14-980-flash-attn2-navit/
+
+*.log
