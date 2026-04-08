@@ -2,17 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-LoRA fine-tuning for ThinkMorph / BAGEL using PEFT + torchrun.
+LoRA fine-tuning for ThinkMorph / BAGEL using PEFT LoRA + FSDP.
 
 Mirrors the structure of pretrain_unified_navit.py exactly — same
 data pipeline, same .cuda(device).to_dict() batch handling, same
-checkpoint layout — but replaces FSDP with PEFT LoRA adapters and
-plain DDP (or no-op for single GPU).
+checkpoint layout — but uses PEFT LoRA adapters with FSDP for
+memory-efficient sharding of frozen base weights.
 
-Launch (single GPU):
-  torchrun --nproc_per_node=1 train/lora_finetune.py [args]
-
-Launch (multi-GPU, single node):
+Launch (single node, 8 GPUs):
   torchrun --nproc_per_node=8 train/lora_finetune.py [args]
 """
 
@@ -26,9 +23,20 @@ import wandb
 from dataclasses import dataclass, field
 from time import time
 
+import functools
+
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    StateDictType,
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointImpl,
+    apply_activation_checkpointing,
+    checkpoint_wrapper,
+)
 from torch.utils.data import DataLoader
 from safetensors.torch import load_file, save_file
 from transformers import HfArgumentParser, set_seed
@@ -47,6 +55,7 @@ from modeling.bagel import (
 )
 from modeling.qwen2 import Qwen2Tokenizer
 from train.train_utils import create_logger, get_latest_ckpt
+from train.fsdp_utils import FSDPConfig, fsdp_wrapper, grad_checkpoint_check_fn
 
 
 # ---------------------------------------------------------------------------
@@ -135,64 +144,128 @@ class TrainingArguments:
     expected_num_tokens: int = field(default=32768)
     gradient_checkpointing: bool = field(default=True)
 
+    # FSDP
+    sharding_strategy: str = field(default="FULL_SHARD",
+        metadata={"help": "FSDP sharding: FULL_SHARD, SHARD_GRAD_OP, HYBRID_SHARD."})
+    num_shard: int = field(default=8,
+        metadata={"help": "Number of FSDP shards (GPUs per shard group for HYBRID_SHARD)."})
+    num_replicate: int = field(default=1,
+        metadata={"help": "Number of model replicas for HYBRID_SHARD."})
+    cpu_offload: bool = field(default=False,
+        metadata={"help": "Offload FSDP parameters to CPU."})
+
 
 # ---------------------------------------------------------------------------
-# Checkpoint helpers
+# Checkpoint helpers (FSDP-aware)
 # ---------------------------------------------------------------------------
 
-def save_lora_checkpoint(step, model, optimizer, scheduler, checkpoint_dir, logger, rank):
-    """Save LoRA adapter + non-LoRA trainable params + optimizer state."""
+def save_lora_checkpoint(step, fsdp_model, optimizer, scheduler, checkpoint_dir,
+                         logger, rank, fsdp_config):
+    """Save LoRA adapter + non-LoRA trainable params via FSDP full state dict,
+    plus sharded optimizer state."""
     save_path = os.path.join(checkpoint_dir, f"{step:07d}")
+
+    # 1. Gather full model state on rank 0, extract only trainable params
+    with FSDP.state_dict_type(
+        fsdp_model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(rank0_only=True, offload_to_cpu=True),
+    ):
+        full_state = fsdp_model.state_dict()
+
     if rank == 0:
         os.makedirs(save_path, exist_ok=True)
-        unwrapped = model.module if isinstance(model, DDP) else model
-        # Separate LoRA weights from other trainable weights
-        trainable_names = {
-            n for n, p in unwrapped.named_parameters() if p.requires_grad
-        }
-        lora_state = {
-            k: v.cpu() for k, v in unwrapped.state_dict().items()
-            if k in trainable_names and "lora_" in k
-        }
-        non_lora_state = {
-            k: v.cpu() for k, v in unwrapped.state_dict().items()
-            if k in trainable_names and "lora_" not in k
+        lora_state = {k: v for k, v in full_state.items() if "lora_" in k}
+        non_lora_trainable = {
+            k: v for k, v in full_state.items()
+            if "lora_" not in k and any(
+                t in k for t in (
+                    "connector.", "vit_pos_embed.",
+                    "vae2llm.", "llm2vae.", "time_embedder.", "latent_pos_embed.",
+                )
+            )
         }
         if lora_state:
             save_file(lora_state, os.path.join(save_path, "lora_weights.safetensors"))
-        if non_lora_state:
-            save_file(non_lora_state, os.path.join(save_path, "non_lora_params.safetensors"))
-        torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
+        if non_lora_trainable:
+            save_file(non_lora_trainable, os.path.join(save_path, "non_lora_params.safetensors"))
+        del full_state
+        logger.info(f"Checkpoint saved → {save_path}")
+
+    # 2. Save sharded optimizer state (each rank saves its own shard)
+    with FSDP.state_dict_type(fsdp_model, StateDictType.LOCAL_STATE_DICT):
+        if fsdp_config.sharding_strategy == "FULL_SHARD":
+            shard_idx = dist.get_rank()
+            total = dist.get_world_size()
+        elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            shard_idx = dist.get_rank() % fsdp_config.num_shard
+            total = fsdp_config.num_shard
+        else:
+            shard_idx = dist.get_rank()
+            total = dist.get_world_size()
+
+        opt_path = os.path.join(save_path, f"optimizer.{shard_idx:05d}-of-{total:05d}.pt")
+        if fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            if dist.get_rank() < fsdp_config.num_shard:
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(optimizer.state_dict(), opt_path)
+        else:
+            os.makedirs(save_path, exist_ok=True)
+            torch.save(optimizer.state_dict(), opt_path)
+
+    if rank == 0:
         torch.save(scheduler.state_dict(), os.path.join(save_path, "scheduler.pt"))
         torch.save({"step": step}, os.path.join(save_path, "train_state.pt"))
-        logger.info(f"Checkpoint saved → {save_path}")
-    if dist.is_initialized():
-        dist.barrier()
+
+    dist.barrier()
 
 
-def load_lora_checkpoint(resume_from, model, optimizer, scheduler, logger):
-    """Resume from a LoRA checkpoint; returns the next train step."""
+def load_lora_checkpoint(resume_from, fsdp_model, optimizer, scheduler, logger,
+                         fsdp_config):
+    """Resume from a LoRA+FSDP checkpoint; returns the next train step."""
     if resume_from is None or not os.path.isdir(resume_from):
         return 0
 
     logger.info(f"Resuming from {resume_from}")
-    unwrapped = model.module if isinstance(model, DDP) else model
 
+    # 1. Load trainable weights via full state dict (broadcast from rank 0)
     lora_path = os.path.join(resume_from, "lora_weights.safetensors")
-    if os.path.isfile(lora_path):
-        state = load_file(lora_path, device="cpu")
-        msg = unwrapped.load_state_dict(state, strict=False)
-        logger.info(f"Loaded LoRA weights: {msg}")
-
     non_lora_path = os.path.join(resume_from, "non_lora_params.safetensors")
-    if os.path.isfile(non_lora_path):
-        state = load_file(non_lora_path, device="cpu")
-        msg = unwrapped.load_state_dict(state, strict=False)
-        logger.info(f"Loaded non-LoRA params: {msg}")
 
-    opt_path = os.path.join(resume_from, "optimizer.pt")
-    if os.path.isfile(opt_path):
-        optimizer.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
+    with FSDP.state_dict_type(
+        fsdp_model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(rank0_only=False, offload_to_cpu=True),
+    ):
+        current = fsdp_model.state_dict()
+        if os.path.isfile(lora_path):
+            lora_state = load_file(lora_path, device="cpu")
+            current.update(lora_state)
+            logger.info(f"Loaded {len(lora_state)} LoRA weight tensors")
+        if os.path.isfile(non_lora_path):
+            non_lora_state = load_file(non_lora_path, device="cpu")
+            current.update(non_lora_state)
+            logger.info(f"Loaded {len(non_lora_state)} non-LoRA trainable tensors")
+        fsdp_model.load_state_dict(current)
+
+    # 2. Load sharded optimizer state
+    with FSDP.state_dict_type(fsdp_model, StateDictType.LOCAL_STATE_DICT):
+        if fsdp_config.sharding_strategy == "FULL_SHARD":
+            shard_idx = dist.get_rank()
+            total = dist.get_world_size()
+        elif fsdp_config.sharding_strategy == "HYBRID_SHARD":
+            shard_idx = dist.get_rank() % fsdp_config.num_shard
+            total = fsdp_config.num_shard
+        else:
+            shard_idx = dist.get_rank()
+            total = dist.get_world_size()
+
+        opt_path = os.path.join(resume_from, f"optimizer.{shard_idx:05d}-of-{total:05d}.pt")
+        if os.path.isfile(opt_path):
+            optimizer.load_state_dict(
+                torch.load(opt_path, map_location="cpu", weights_only=True)
+            )
+            logger.info(f"Loaded optimizer shard {shard_idx}")
 
     sch_path = os.path.join(resume_from, "scheduler.pt")
     if os.path.isfile(sch_path):
@@ -336,62 +409,8 @@ def main():
             p.requires_grad_(False)
 
     if training_args.gradient_checkpointing:
-        # The custom Qwen2Model.forward_train() doesn't implement gradient
-        # checkpointing (no _gradient_checkpointing_func call). Monkey-patch
-        # the layer loop to wrap each decoder layer with torch.utils.checkpoint.
-        import functools
-        from torch.utils.checkpoint import checkpoint as ckpt_fn
-
-        qwen2_model = model.language_model.model  # Qwen2Model
-        _orig_forward_train = qwen2_model.forward_train
-
-        @functools.wraps(_orig_forward_train)
-        def _forward_train_with_grad_ckpt(
-            packed_sequence, sample_lens, attention_mask, packed_position_ids,
-            packed_und_token_indexes=None, packed_gen_token_indexes=None,
-        ):
-            if qwen2_model.config.freeze_und:
-                packed_sequence[packed_und_token_indexes] = packed_sequence[packed_und_token_indexes].detach()
-
-            cos, sin = qwen2_model.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
-            cos = cos.squeeze(0)
-            sin = sin.squeeze(0)
-            packed_position_embeddings = (cos, sin)
-
-            extra_inputs = {}
-            if qwen2_model.use_moe:
-                assert packed_und_token_indexes is not None
-                if packed_gen_token_indexes is None:
-                    packed_gen_token_indexes = packed_und_token_indexes.new_ones(size=[0])
-                extra_inputs.update(
-                    packed_und_token_indexes=packed_und_token_indexes,
-                    packed_gen_token_indexes=packed_gen_token_indexes,
-                )
-
-            for decoder_layer in qwen2_model.layers:
-                packed_sequence = ckpt_fn(
-                    decoder_layer,
-                    packed_sequence,
-                    sample_lens,
-                    attention_mask,
-                    packed_position_embeddings,
-                    use_reentrant=False,
-                    **extra_inputs,
-                )
-
-            if qwen2_model.use_moe:
-                packed_sequence_ = torch.zeros_like(packed_sequence)
-                packed_sequence_[packed_und_token_indexes] = qwen2_model.norm(packed_sequence[packed_und_token_indexes])
-                if qwen2_model.config.freeze_und:
-                    packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
-                packed_sequence_[packed_gen_token_indexes] = qwen2_model.norm_moe_gen(packed_sequence[packed_gen_token_indexes])
-                return packed_sequence_
-            else:
-                return qwen2_model.norm(packed_sequence)
-
-        qwen2_model.forward_train = _forward_train_with_grad_ckpt
-        if rank == 0:
-            logger.info("Gradient checkpointing enabled (monkey-patched Qwen2Model.forward_train)")
+        # Will be applied after FSDP wrapping (see below)
+        pass
 
     if rank == 0:
         lora_params = sum(p.numel() for n, p in model.language_model.named_parameters() if "lora_" in n)
@@ -424,18 +443,36 @@ def main():
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"Total: {total:,}  Trainable: {trainable:,} ({100*trainable/total:.2f}%)")
 
-    # Move to device in bf16 BEFORE DDP wrap
-    model.to(device=device, dtype=torch.bfloat16)
+    # ── FSDP wrapping (replaces DDP) ─────────────────────────────────────────
+    fsdp_config = FSDPConfig(
+        sharding_strategy=training_args.sharding_strategy,
+        backward_prefetch="BACKWARD_PRE",
+        cpu_offload=training_args.cpu_offload,
+        num_replicate=training_args.num_replicate,
+        num_shard=training_args.num_shard,
+    )
+    fsdp_model = fsdp_wrapper(model, fsdp_config, use_orig_params=True)
+
+    if training_args.gradient_checkpointing:
+        apply_activation_checkpointing(
+            fsdp_model,
+            checkpoint_wrapper_fn=functools.partial(
+                checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+            ),
+            check_fn=grad_checkpoint_check_fn,
+        )
+        if rank == 0:
+            logger.info("Gradient checkpointing enabled (FSDP activation checkpointing)")
+
     if training_args.visual_gen:
         vae_model.to(device=device, dtype=torch.bfloat16).eval()
 
-    # DDP wrap (no-op for single GPU since world_size == 1)
-    if world_size > 1:
-        model = DDP(model, device_ids=[device], find_unused_parameters=True)
+    if rank == 0:
+        logger.info(f"FSDP wrapping complete, strategy={training_args.sharding_strategy}")
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        [p for p in fsdp_model.parameters() if p.requires_grad],
         lr=training_args.lr,
         betas=(training_args.beta1, training_args.beta2),
         eps=training_args.eps,
@@ -458,7 +495,9 @@ def main():
     resume_from = training_args.resume_from
     if training_args.auto_resume and resume_from is None:
         resume_from = get_latest_ckpt(training_args.checkpoint_dir)
-    train_step = load_lora_checkpoint(resume_from, model, optimizer, scheduler, logger)
+    train_step = load_lora_checkpoint(
+        resume_from, fsdp_model, optimizer, scheduler, logger, fsdp_config
+    )
 
     # ── Dataset (identical to pretrain_unified_navit.py) ─────────────────────
     with open(data_args.dataset_config_file, "r") as f:
@@ -501,8 +540,8 @@ def main():
         prefetch_factor=data_args.prefetch_factor,
     )
 
-    # ── Training loop (identical structure to pretrain_unified_navit.py) ─────
-    model.train()
+    # ── Training loop ──────────────────────────────────────────────────────────
+    fsdp_model.train()
     start_time = time()
     logger.info(f"LoRA fine-tuning for {training_args.total_steps} steps from step {train_step}…")
 
@@ -520,15 +559,19 @@ def main():
                 if training_args.visual_gen:
                     with torch.no_grad():
                         data["padded_latent"] = vae_model.encode(data.pop("padded_images"))
-                loss_dict = model(**data)
+                loss_dict = fsdp_model(**data)
 
             loss = torch.tensor(0.0, device=device)
 
             ce = loss_dict["ce"]
             if ce is not None:
                 total_ce_tokens = torch.tensor(len(data["ce_loss_indexes"]), device=device)
-                if world_size > 1:
-                    dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
+            else:
+                total_ce_tokens = torch.tensor(0, device=device)
+            if world_size > 1:
+                dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
+
+            if ce is not None and total_ce_tokens > 0:
                 if training_args.ce_loss_reweighting and ce_loss_weights is not None:
                     ce = (ce * ce_loss_weights).sum() * world_size / ce_loss_weights.sum()
                 else:
@@ -537,26 +580,28 @@ def main():
                 loss = loss + ce * training_args.ce_weight
             else:
                 loss_dict["ce"] = torch.tensor(0.0, device=device)
-                total_ce_tokens = torch.tensor(0, device=device)
 
             if training_args.visual_gen:
                 mse = loss_dict["mse"]
-                total_mse_tokens = torch.tensor(len(data["mse_loss_indexes"]), device=device)
+                if mse is not None:
+                    total_mse_tokens = torch.tensor(len(data["mse_loss_indexes"]), device=device)
+                else:
+                    total_mse_tokens = torch.tensor(0, device=device)
                 if world_size > 1:
                     dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
-                mse = mse.mean(dim=-1).sum() * world_size / total_mse_tokens
-                loss_dict["mse"] = mse.detach()
-                loss = loss + mse * training_args.mse_weight
+                if mse is not None and total_mse_tokens > 0:
+                    mse = mse.mean(dim=-1).sum() * world_size / total_mse_tokens
+                    loss_dict["mse"] = mse.detach()
+                    loss = loss + mse * training_args.mse_weight
+                else:
+                    loss_dict["mse"] = torch.tensor(0.0, device=device)
             else:
                 loss_dict["mse"] = torch.tensor(0.0, device=device)
                 total_mse_tokens = torch.tensor(0, device=device)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                training_args.max_grad_norm,
-            )
+            fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
             optimizer.step()
             scheduler.step()
 
@@ -591,14 +636,14 @@ def main():
         # Checkpoint
         if curr_step > 0 and curr_step % training_args.save_every == 0:
             save_lora_checkpoint(
-                curr_step, model, optimizer, scheduler,
-                training_args.checkpoint_dir, logger, rank,
+                curr_step, fsdp_model, optimizer, scheduler,
+                training_args.checkpoint_dir, logger, rank, fsdp_config,
             )
 
     # Final checkpoint
     save_lora_checkpoint(
-        training_args.total_steps, model, optimizer, scheduler,
-        training_args.checkpoint_dir, logger, rank,
+        training_args.total_steps, fsdp_model, optimizer, scheduler,
+        training_args.checkpoint_dir, logger, rank, fsdp_config,
     )
     logger.info("LoRA fine-tuning complete.")
     if rank == 0:

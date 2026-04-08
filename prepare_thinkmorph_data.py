@@ -116,7 +116,7 @@ def write_shards(rows, out_dir, rows_per_shard=500):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir",     default="/home/b-bsachdeva/data")
+    parser.add_argument("--output_dir",     default="/home/aiscuser/data")
     parser.add_argument("--datasets",       nargs="+", default=HF_DATASETS)
     parser.add_argument("--rows_per_shard", type=int,  default=500)
     parser.add_argument("--no_update_dataset_info", action="store_true")

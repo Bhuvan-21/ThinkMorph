@@ -23,14 +23,14 @@ LLM_PATH="${LLM_PATH:-hf/Qwen2.5-7B-Instruct}"
 VAE_PATH="${VAE_PATH:-flux/vae/ae.safetensors}"
 VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
 
-DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/lora}"
-CKPT_DIR="${CKPT_DIR:-results/lora/checkpoints}"
-RESUME_FROM="${RESUME_FROM:-}"
-
-WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora-test}"
-WANDB_NAME="${WANDB_NAME:-interleaved-reasoning}"
+WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora-8x}"
+WANDB_NAME="${WANDB_NAME:-interleaved-reasoning-dropout-fixed}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
+
+DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-/scratch/azureml/cr/j/e8d7437b02bf4e3dab4876359a03ea40/cap/data-capability/wd/INPUT_karan/thinkmorph/results/lora}"
+CKPT_DIR="${CKPT_DIR:-/scratch/azureml/cr/j/e8d7437b02bf4e3dab4876359a03ea40/cap/data-capability/wd/INPUT_karan/thinkmorph/results/lora/checkpoints/dropout_fixed}"
+RESUME_FROM="${RESUME_FROM:-}"
 
 # Training hyper-parameters
 TOTAL_STEPS="${TOTAL_STEPS:-8000}"
@@ -39,7 +39,7 @@ LR="${LR:-1e-4}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 MSE_WEIGHT="${MSE_WEIGHT:-1.0}"
 CE_WEIGHT="${CE_WEIGHT:-1.0}"
-MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-8192}"
+MAX_NUM_TOKENS_PER_SAMPLE="${MAX_NUM_TOKENS_PER_SAMPLE:-32768}"
 MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-32768}"
 EXPECTED_NUM_TOKENS="${EXPECTED_NUM_TOKENS:-32768}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
@@ -53,7 +53,7 @@ LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_pro
 # Distributed settings
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"   # 1 = single GPU
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"   # 1 = single GPU
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ torchrun \
   --max_latent_size 64 \
   \
   --dataset_config_file "${DATASET_CONFIG}" \
-  --num_workers 4 \
+  --num_workers 8 \
   --max_num_tokens_per_sample "${MAX_NUM_TOKENS_PER_SAMPLE}" \
   --max_num_tokens "${MAX_NUM_TOKENS}" \
   --expected_num_tokens "${EXPECTED_NUM_TOKENS}" \
@@ -102,8 +102,10 @@ torchrun \
   --vae_cond_dropout_prob 0.3 \
   --vit_cond_dropout_prob 0.3 \
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
+  --sharding_strategy FULL_SHARD \
+  --cpu_offload True \
   --log_every 10 \
-  --save_every 500 \
+  --save_every 1000 \
   \
   --lora_r "${LORA_R}" \
   --lora_alpha "${LORA_ALPHA}" \

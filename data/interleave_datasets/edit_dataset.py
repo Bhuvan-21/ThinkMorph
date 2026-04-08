@@ -15,6 +15,16 @@ MaximumDecompressedSize = 1024
 MegaByte = 2 ** 20
 PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
 
+THINK_SYSTEM_PROMPT = (
+    "Let's think step by step to answer the question. "
+    "For text-based thinking, enclose the process within <think> </think>, "
+    "e.g. <think> thinking process here </think>. "
+    "For visual thinking, enclose the content within <image_start> </image_end>, "
+    "e.g. <image_start> thinking image here </image_end>. "
+    "Finally conclude with the final answer wrapped in <answer></answer> tags, "
+    "i.e.<answer> answer here </answer>."
+)
+
 
 class UnifiedEditIterableDataset(InterleavedBaseIterableDataset, ParquetStandardIterableDataset):
 
@@ -24,7 +34,7 @@ class UnifiedEditIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
         images  = row["image_list"]
         outputs = row["output_text_list"]
 
-        
+        data = self._add_text(data, THINK_SYSTEM_PROMPT, need_loss=False)
         data = self._add_image(
             data,
             pil_img2rgb(Image.open(io.BytesIO(images[0]))),
