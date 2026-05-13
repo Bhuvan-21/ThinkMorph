@@ -36,28 +36,28 @@ DATASET_INFO = {
 THINKMORPH_DATASET_INFO = {
     'thinkmorph_reasoning': {
         'Jigsaw_Assembly': {
-            'data_dir': '/home/aiscuser/data/thinkmorph/Jigsaw_Assembly',
+            'data_dir': '/workspace/data/thinkmorph/Jigsaw_Assembly',
             'num_files': 12,
             'num_total_samples': 6000,
-            'parquet_info_path': '/home/aiscuser/data/thinkmorph/parquet_info/Jigsaw_Assembly.json',
+            'parquet_info_path': '/workspace/data/thinkmorph/parquet_info/Jigsaw_Assembly.json',
         },
         'Spatial_Navigation': {
-            'data_dir': '/home/aiscuser/data/thinkmorph/Spatial_Navigation',
+            'data_dir': '/workspace/data/thinkmorph/Spatial_Navigation',
             'num_files': 12,
             'num_total_samples': 6000,
-            'parquet_info_path': '/home/aiscuser/data/thinkmorph/parquet_info/Spatial_Navigation.json',
+            'parquet_info_path': '/workspace/data/thinkmorph/parquet_info/Spatial_Navigation.json',
         },
         'Visual_Search': {
-            'data_dir': '/home/aiscuser/data/thinkmorph/Visual_Search',
+            'data_dir': '/workspace/data/thinkmorph/Visual_Search',
             'num_files': 14,
             'num_total_samples': 6990,
-            'parquet_info_path': '/home/aiscuser/data/thinkmorph/parquet_info/Visual_Search.json',
+            'parquet_info_path': '/workspace/data/thinkmorph/parquet_info/Visual_Search.json',
         },
         'Chart_Refocus': {
-            'data_dir': '/home/aiscuser/data/thinkmorph/Chart_Refocus',
+            'data_dir': '/workspace/data/thinkmorph/Chart_Refocus',
             'num_files': 12,
             'num_total_samples': 6000,
-            'parquet_info_path': '/home/aiscuser/data/thinkmorph/parquet_info/Chart_Refocus.json',
+            'parquet_info_path': '/workspace/data/thinkmorph/parquet_info/Chart_Refocus.json',
         },
     },
 }

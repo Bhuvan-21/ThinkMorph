@@ -18,18 +18,18 @@ cd "$(dirname "$(realpath "$0")")/.."   # always run from project root
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── User-configurable settings ────────────────────────────────────────────────
-MODEL_PATH="${MODEL_PATH:-BAGEL-7B-MoT}"
+MODEL_PATH="${MODEL_PATH:-/workspace/BAGEL-7B-MoT}"
 LLM_PATH="${LLM_PATH:-hf/Qwen2.5-7B-Instruct}"
 VAE_PATH="${VAE_PATH:-flux/vae/ae.safetensors}"
-VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
+VIT_PATH="${VIT_PATH:-/workspace/siglip-so400m-14-980-flash-attn2-navit}"
 
-WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora-8x}"
+WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-lora-8xb200}"
 WANDB_NAME="${WANDB_NAME:-interleaved-reasoning-dropout-fixed}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-/scratch/azureml/cr/j/e8d7437b02bf4e3dab4876359a03ea40/cap/data-capability/wd/INPUT_karan/thinkmorph/results/lora}"
-CKPT_DIR="${CKPT_DIR:-/scratch/azureml/cr/j/e8d7437b02bf4e3dab4876359a03ea40/cap/data-capability/wd/INPUT_karan/thinkmorph/results/lora/checkpoints/dropout_fixed}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora}"
+CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora/checkpoints/dropout_fixed}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # Training hyper-parameters
@@ -81,7 +81,7 @@ torchrun \
   --max_latent_size 64 \
   \
   --dataset_config_file "${DATASET_CONFIG}" \
-  --num_workers 8 \
+  --num_workers 4 \
   --max_num_tokens_per_sample "${MAX_NUM_TOKENS_PER_SAMPLE}" \
   --max_num_tokens "${MAX_NUM_TOKENS}" \
   --expected_num_tokens "${EXPECTED_NUM_TOKENS}" \
@@ -103,7 +103,7 @@ torchrun \
   --vit_cond_dropout_prob 0.3 \
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
   --sharding_strategy FULL_SHARD \
-  --cpu_offload True \
+  --cpu_offload False \
   --log_every 10 \
   --save_every 1000 \
   \
