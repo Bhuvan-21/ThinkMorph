@@ -9,7 +9,8 @@ import re
 import json
 from typing import Optional
 from PIL import Image, ImageFile, PngImagePlugin
-
+import sys
+sys.path.append("/data/b-bsachdeva/ThinkMorph")
 from data.interleave_datasets.interleave_t2i_dataset import ParquetStandardIterableDataset
 from data.data_utils import pil_img2rgb
 from data.transforms import ImageTransform

@@ -16,29 +16,29 @@ cd "$(dirname "$(realpath "$0")")/.."   # always run from project root
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_PATH="${MODEL_PATH:-BAGEL-7B-MoT}"
+MODEL_PATH="${MODEL_PATH:-/workspace/lora_merged/bagel_6K_steps}"
 LLM_PATH="${LLM_PATH:-hf/Qwen2.5-7B-Instruct}"
 VAE_PATH="${VAE_PATH:-flux/vae/ae.safetensors}"
 VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
 
 # ── Data & output ─────────────────────────────────────────────────────────────
-DATASET_CONFIG="${DATASET_CONFIG:-data/configs/grpo_interleaved.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/grpo}"
-CKPT_DIR="${CKPT_DIR:-results/grpo/checkpoints}"
+DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo}"
+CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo/checkpoints/dropout_fixed}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
-WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-grpo}"
+WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-grpo-8xb200}"
 WANDB_NAME="${WANDB_NAME:-grpo-interleaved}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 # ── GRPO hyperparameters ──────────────────────────────────────────────────────
-GROUP_SIZE="${GROUP_SIZE:-4}"
+GROUP_SIZE="${GROUP_SIZE:-8}"
 CLIP_EPSILON="${CLIP_EPSILON:-0.2}"
 KL_WEIGHT="${KL_WEIGHT:-0.01}"
 REWARD_TYPE="${REWARD_TYPE:-exact_match}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
-MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-8192}"
+MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-16384}"
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-50}"
 LOG_SKIPPED="${LOG_SKIPPED:-true}"
@@ -60,7 +60,7 @@ LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_pro
 # ── Distributed settings ──────────────────────────────────────────────────────
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"   # 1 = single GPU
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"   # 1 = single GPU
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 # ──────────────────────────────────────────────────────────────────────────────
