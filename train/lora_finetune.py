@@ -282,12 +282,16 @@ def load_lora_checkpoint(resume_from, fsdp_model, optimizer, scheduler, logger,
 # ---------------------------------------------------------------------------
 
 def main():
-    # ── Distributed init (same as pretrain_unified_navit.py) ─────────────────
+    # ── Distributed init ──────────────────────────────────────────────────────
+    # Set CUDA device BEFORE init_process_group and pass device_id so NCCL
+    # binds the rank → GPU mapping up-front (avoids the "device used by this
+    # process is currently unknown" warning / potential hang on PyTorch ≥2.4).
     assert torch.cuda.is_available()
-    dist.init_process_group("nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     rank   = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device)
+    device = local_rank
     world_size = dist.get_world_size()
 
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
