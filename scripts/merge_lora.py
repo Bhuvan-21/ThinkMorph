@@ -26,7 +26,7 @@ from safetensors.torch import load_file, save_file
 
 def main():
     parser = argparse.ArgumentParser(description="Merge LoRA weights into base BAGEL model")
-    parser.add_argument("--model_path", type=str, default="BAGEL-7B-MoT")
+    parser.add_argument("--model_path", type=str, default="/workspace/BAGEL-7B-MoT")
     parser.add_argument("--lora_ckpt", type=str, default="results/lora/checkpoints/0002500")
     parser.add_argument("--output_dir", type=str, default="results/merged")
     parser.add_argument("--lora_r", type=int, default=32)

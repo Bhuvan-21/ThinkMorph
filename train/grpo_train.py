@@ -321,11 +321,15 @@ def compute_sequence_log_probs(model, tokenizer, new_token_ids, prompt_text, gen
 # ---------------------------------------------------------------------------
 
 def main():
+    # Set CUDA device BEFORE init_process_group and pass device_id so NCCL
+    # binds the rank → GPU mapping up-front (avoids the "device used by this
+    # process is currently unknown" warning / potential hang on PyTorch ≥2.4).
     assert torch.cuda.is_available()
-    dist.init_process_group("nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device)
+    device = local_rank
     world_size = dist.get_world_size()
 
     parser = HfArgumentParser((ModelArguments, DataArguments, GRPOArguments, TrainingArguments))
@@ -753,27 +757,52 @@ def main():
             elapsed = time() - start_time
             steps_per_sec = training_args.log_every / max(elapsed, 1e-8)
 
-            n = max(accum_completions, 1)
-            r_mean = accum_reward_sum / max(accum_reward_count, 1)
+            # All-reduce accumulators across ranks so logged metrics reflect
+            # the full effective batch (world_size × accum_steps prompts),
+            # not just rank 0's local view.
+            g_reward_sum   = accum_reward_sum
+            g_reward_count = accum_reward_count
+            g_policy_loss  = accum_policy_loss
+            g_kl           = accum_kl
+            g_clip_frac    = accum_clip_frac
+            g_completions  = accum_completions
+            g_skipped      = accum_skipped
+            if world_size > 1:
+                t = torch.tensor(
+                    [g_reward_sum, float(g_reward_count),
+                     g_policy_loss, g_kl, g_clip_frac,
+                     float(g_completions), float(g_skipped)],
+                    device=device, dtype=torch.float64,
+                )
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                (g_reward_sum, g_reward_count_f,
+                 g_policy_loss, g_kl, g_clip_frac,
+                 g_completions_f, g_skipped_f) = t.tolist()
+                g_reward_count = int(g_reward_count_f)
+                g_completions  = int(g_completions_f)
+                g_skipped      = int(g_skipped_f)
+
+            n = max(g_completions, 1)
+            r_mean = g_reward_sum / max(g_reward_count, 1)
             msg = (
                 f"(step={curr_step:07d}) "
                 f"reward_mean: {r_mean:.3f}, "
-                f"policy_loss: {accum_policy_loss/n:.4f}, "
-                f"kl: {accum_kl/n:.4f}, "
-                f"clip_frac: {accum_clip_frac/n:.3f}, "
-                f"completions: {accum_completions}, "
-                f"skipped: {accum_skipped}/{accum_steps}, "
+                f"policy_loss: {g_policy_loss/n:.4f}, "
+                f"kl: {g_kl/n:.4f}, "
+                f"clip_frac: {g_clip_frac/n:.3f}, "
+                f"completions: {g_completions}, "
+                f"skipped: {g_skipped}/{accum_steps * world_size}, "
                 f"Steps/Sec: {steps_per_sec:.3f}"
             )
             logger.info(msg)
             if rank == 0:
                 wandb.log({
                     "reward_mean": r_mean,
-                    "policy_loss": accum_policy_loss / n,
-                    "kl_divergence": accum_kl / n,
-                    "clip_fraction": accum_clip_frac / n,
-                    "num_completions": accum_completions,
-                    "num_skipped": accum_skipped,
+                    "policy_loss": g_policy_loss / n,
+                    "kl_divergence": g_kl / n,
+                    "clip_fraction": g_clip_frac / n,
+                    "num_completions": g_completions,
+                    "num_skipped": g_skipped,
                     "lr": optimizer.param_groups[0]["lr"],
                     "mem_allocated_MB": torch.cuda.max_memory_allocated() / 1024**2,
                 }, step=curr_step)
