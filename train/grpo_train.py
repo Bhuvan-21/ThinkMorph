@@ -529,9 +529,11 @@ def main():
     lora_ref = LoRAReference(model)
     logger.info("Reference LoRA weights captured for KL regularization")
 
-    # DDP
-    if world_size > 1:
-        model = DDP(model, device_ids=[device], find_unused_parameters=True)
+    # No DDP wrap. GRPO's policy update issues a variable number of backward()
+    # calls per rank (rollouts are filtered by reward variance, generation length,
+    # forward-failure exceptions, etc.), which breaks DDP's implicit assumption
+    # that every rank enqueues matching gradient AllReduces in lockstep. We sync
+    # gradients manually once per optimizer step instead — see the loop below.
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -741,12 +743,40 @@ def main():
                 accum_clip_frac += loss_dict["clip_fraction"].item()
                 accum_completions += 1
 
-        # ── Optimizer step (after all micro-steps) ───────────────────────
-        if accum_completions > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                training_args.max_grad_norm,
-            )
+        # ── Manual gradient sync across ranks ────────────────────────────
+        # Pad missing grads with zeros so every rank participates in the same
+        # AllReduces regardless of how many backward() calls it issued (a rank
+        # may legitimately have accum_completions == 0 if every prompt in its
+        # micro-batch was skipped). One flat AllReduce per dtype keeps the
+        # collective count to O(1) instead of O(num_params).
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if world_size > 1:
+            for p in trainable_params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+            buckets = {}
+            for p in trainable_params:
+                buckets.setdefault(p.grad.dtype, []).append(p)
+            for dtype, ps in buckets.items():
+                flat = torch.cat([p.grad.detach().flatten() for p in ps])
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                flat.div_(world_size)
+                offset = 0
+                for p in ps:
+                    n = p.grad.numel()
+                    p.grad.copy_(flat[offset:offset + n].view_as(p.grad))
+                    offset += n
+
+        # Decide globally whether to step the optimizer + scheduler. Both must
+        # be called consistently on every rank to keep LR schedules aligned.
+        global_completions = accum_completions
+        if world_size > 1:
+            t = torch.tensor([float(accum_completions)], device=device, dtype=torch.float64)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            global_completions = int(t.item())
+
+        if global_completions > 0:
+            torch.nn.utils.clip_grad_norm_(trainable_params, training_args.max_grad_norm)
             optimizer.step()
             scheduler.step()
         optimizer.zero_grad()
