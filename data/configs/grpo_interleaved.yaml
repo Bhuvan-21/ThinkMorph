@@ -1,13 +1,13 @@
 # GRPO interleaved reasoning training config
-# Uses the same ThinkMorph datasets as thinkmorph_reasoning.yaml
-# but intended for GRPO RL fine-tuning (prompt + GT answer extraction).
+# Uses the GRPO half of the 10K/14K stratified split (see split_thinkmorph_data.py).
+# Disjoint from the SFT half referenced by thinkmorph_reasoning.yaml.
 
 thinkmorph_reasoning:
   dataset_names:
-  - Jigsaw_Assembly
-  # - Spatial_Navigation
-  # - Visual_Search
-  # - Chart_Refocus
+  - Jigsaw_Assembly_grpo
+  - Spatial_Navigation_grpo
+  - Visual_Search_grpo
+  - Chart_Refocus_grpo
   image_transform_args:
     image_stride: 16
     max_image_size: 1024
@@ -18,8 +18,8 @@ thinkmorph_reasoning:
     min_image_size: 224
   is_mandatory: true
   num_used_data:
-  - 6000
-  - 6000
-  - 6990
-  - 6000
+  - 3500
+  - 3500
+  - 3990
+  - 3500
   weight: 1

@@ -522,10 +522,31 @@ def main():
         logger.info(f"Total: {total:,}  Trainable: {trainable:,} ({100*trainable/total:.2f}%)")
 
     model.to(device=device, dtype=torch.bfloat16)
+    # Keep trainable params (LoRA + connector + vae2llm/llm2vae heads) in fp32.
+    # AdamW updates at lr=1e-5 underflow in bf16 — the bf16 mantissa can't
+    # represent lr * m_hat / (sqrt(v_hat) + eps) for typical LoRA gradients,
+    # so updates stall silently. Autocast in the forward gives bf16 compute.
+    for p in model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
     if training_args.visual_gen:
         vae_model.to(device=device, dtype=torch.bfloat16).eval()
 
     # ── Reference model (frozen LoRA snapshot) ───────────────────────────────
+    # The KL reference for GRPO is the SFT-merged base model — i.e. the policy
+    # *before* this GRPO run started. With PEFT's default init, lora_A is
+    # kaiming and lora_B is zero, so the freshly-injected adapter contributes
+    # nothing to logits and "the model right now" *is* the SFT policy.
+    # We snapshot here, BEFORE load_grpo_checkpoint runs, so a resumed run
+    # still uses the SFT model (not the previous checkpoint) as its reference
+    # — otherwise resumes would compound KL drift across runs.
+    unwrapped = model.module if isinstance(model, DDP) else model
+    for n, p in unwrapped.language_model.named_parameters():
+        if "lora_B" in n:
+            assert torch.all(p == 0), (
+                f"LoRA reference invariant violated: {n} is not zero at snapshot "
+                f"time. The KL reference would no longer equal the SFT model."
+            )
     lora_ref = LoRAReference(model)
     logger.info("Reference LoRA weights captured for KL regularization")
 

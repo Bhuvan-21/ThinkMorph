@@ -16,13 +16,13 @@ cd "$(dirname "$(realpath "$0")")/.."   # always run from project root
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_PATH="${MODEL_PATH:-/workspace/lora_merged/bagel_8K/}"
+MODEL_PATH="${MODEL_PATH:-/workspace/bagel-lora-merged-8K}"
 LLM_PATH="${LLM_PATH:-hf/Qwen2.5-7B-Instruct}"
-VAE_PATH="${VAE_PATH:-flux/vae/ae.safetensors}"
+VAE_PATH="${VAE_PATH:-/workspace/bagel-lora-merged-8K/ae.safetensors}"
 VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
 
 # ── Data & output ─────────────────────────────────────────────────────────────
-DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
+DATASET_CONFIG="${DATASET_CONFIG:-data/configs/grpo_interleaved.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo}"
 CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo/checkpoints/dropout_fixed}"
 RESUME_FROM="${RESUME_FROM:-}"
@@ -33,7 +33,7 @@ WANDB_NAME="${WANDB_NAME:-grpo-interleaved}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 # ── GRPO hyperparameters ──────────────────────────────────────────────────────
-GROUP_SIZE="${GROUP_SIZE:-8}"
+GROUP_SIZE="${GROUP_SIZE:-16}"
 CLIP_EPSILON="${CLIP_EPSILON:-0.2}"
 KL_WEIGHT="${KL_WEIGHT:-0.01}"
 REWARD_TYPE="${REWARD_TYPE:-exact_match}"
@@ -55,7 +55,7 @@ GRADIENT_ACCUM="${GRADIENT_ACCUM:-1}"
 LORA_R="${LORA_R:-64}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
-LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen}"
 
 # ── Distributed settings ──────────────────────────────────────────────────────
 NNODES="${NNODES:-1}"
