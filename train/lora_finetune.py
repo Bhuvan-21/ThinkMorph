@@ -407,6 +407,24 @@ def main():
     )
     inject_adapter_in_model(lora_config, model.language_model)
 
+    # DIAGNOSTIC: list every LoRA-wrapped module so we can verify
+    # _moe_gen projections actually received adapters. Remove after debugging.
+    if rank == 0:
+        wrapped = sorted({
+            n.rsplit(".lora_", 1)[0]
+            for n, _ in model.language_model.named_parameters()
+            if ".lora_" in n
+        })
+        logger.info(f"[LoRA diag] {len(wrapped)} modules wrapped:")
+        for w in wrapped[:8]:
+            logger.info(f"  {w}")
+        moe_wrapped = [w for w in wrapped if "moe_gen" in w]
+        logger.info(f"[LoRA diag] {len(moe_wrapped)} are *_moe_gen modules "
+                    f"(expect ~4 × num_layers if working)")
+        if moe_wrapped:
+            for w in moe_wrapped[:4]:
+                logger.info(f"  {w}")
+
     # Freeze all LLM base params; LoRA params are already requires_grad=True
     for n, p in model.language_model.named_parameters():
         if "lora_" not in n:
