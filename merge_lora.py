@@ -26,7 +26,7 @@ from safetensors.torch import load_file, save_file
 
 def main():
     parser = argparse.ArgumentParser(description="Merge LoRA weights into base BAGEL model")
-    parser.add_argument("--model_path", type=str, default="BAGEL-7B-MoT")
+    parser.add_argument("--model_path", type=str, default="/workspace/BAGEL-7B-MoT")
     parser.add_argument("--lora_ckpt", type=str, default="results/lora/checkpoints/0001000")
     parser.add_argument("--output_dir", type=str, default="results/merged")
     parser.add_argument("--lora_r", type=int, default=64)
@@ -75,8 +75,9 @@ def main():
 
         lora_A = lora[a_key]   # (r, in_features)
         lora_B = lora[b_key]   # (out_features, r)
-        delta = (lora_B @ lora_A).to(base[base_key].dtype)
-        base[base_key] = base[base_key] + scaling * delta
+        # fp32 matmul so we don't lose mantissa bits when LoRA was saved as bf16
+        delta = (lora_B.float() @ lora_A.float()) * scaling
+        base[base_key] = (base[base_key].float() + delta).to(base[base_key].dtype)
         merged_count += 1
 
         # Print short name
