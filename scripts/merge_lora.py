@@ -27,10 +27,10 @@ from safetensors.torch import load_file, save_file
 def main():
     parser = argparse.ArgumentParser(description="Merge LoRA weights into base BAGEL model")
     parser.add_argument("--model_path", type=str, default="/workspace/BAGEL-7B-MoT")
-    parser.add_argument("--lora_ckpt", type=str, default="results/lora/checkpoints/0002500")
+    parser.add_argument("--lora_ckpt", type=str, default="results/lora/checkpoints/0001000")
     parser.add_argument("--output_dir", type=str, default="results/merged")
-    parser.add_argument("--lora_r", type=int, default=32)
-    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_r", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=128)
     args = parser.parse_args()
 
     scaling = args.lora_alpha / args.lora_r
@@ -75,8 +75,9 @@ def main():
 
         lora_A = lora[a_key]   # (r, in_features)
         lora_B = lora[b_key]   # (out_features, r)
-        delta = (lora_B @ lora_A).to(base[base_key].dtype)
-        base[base_key] = base[base_key] + scaling * delta
+        # fp32 matmul so we don't lose mantissa bits when LoRA was saved as bf16
+        delta = (lora_B.float() @ lora_A.float()) * scaling
+        base[base_key] = (base[base_key].float() + delta).to(base[base_key].dtype)
         merged_count += 1
 
         # Print short name
@@ -98,14 +99,14 @@ def main():
     print(f"Saving merged model to {output_path}...")
     save_file(base, output_path)
 
-    # Copy config files and VAE weights from the base model
+    # Copy config files from the base model
     for fname in [
-        "ae.safetensors",
         "config.json", "llm_config.json", "vit_config.json",
         "generation_config.json", "preprocessor_config.json",
         "tokenizer_config.json", "tokenizer.json",
         "merges.txt", "vocab.json",
         "model.safetensors.index.json",
+        "ae.safetensors"
     ]:
         src = os.path.join(args.model_path, fname)
         if os.path.isfile(src):
@@ -116,4 +117,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
