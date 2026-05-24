@@ -28,13 +28,13 @@ WANDB_NAME="${WANDB_NAME:-interleaved-reasoning-lora-fixed}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 DATASET_CONFIG="${DATASET_CONFIG:-data/configs/thinkmorph_reasoning.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora-v2}"
-CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora-v2/checkpoints/}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora-subset}"
+CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/lora-subset/checkpoints/}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # Training hyper-parameters
-TOTAL_STEPS="${TOTAL_STEPS:-8000}"
-WARMUP_STEPS="${WARMUP_STEPS:-400}"
+TOTAL_STEPS="${TOTAL_STEPS:-2500}"
+WARMUP_STEPS="${WARMUP_STEPS:-250}"
 LR="${LR:-1e-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 MSE_WEIGHT="${MSE_WEIGHT:-1.0}"
@@ -106,7 +106,7 @@ torchrun \
   --sharding_strategy FULL_SHARD \
   --cpu_offload False \
   --log_every 10 \
-  --save_every 2000 \
+  --save_every 500 \
   \
   --lora_r "${LORA_R}" \
   --lora_alpha "${LORA_ALPHA}" \
