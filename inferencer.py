@@ -61,6 +61,29 @@ class InterleaveInferencer:
         return gen_context
 
     @torch.no_grad()
+    def update_context_token_ids(self, token_ids, gen_context):
+        """
+        Append raw token IDs (no BOS/EOS wrap, no re-tokenization) to the KV
+        cache. Used by GRPO to inject the model's actually-sampled IDs between
+        rounds so the cache stays consistent with what the model generated —
+        and with what the policy/ref forward will see at log-prob time.
+        """
+        past_key_values = gen_context['past_key_values']
+        kv_lens = gen_context['kv_lens']
+        ropes = gen_context['ropes']
+        generation_input, kv_lens, ropes = self.model.prepare_token_ids(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            token_ids_list=[list(token_ids)],
+            new_token_ids=self.new_token_ids,
+        )
+        past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)
+        gen_context['kv_lens'] = kv_lens
+        gen_context['ropes'] = ropes
+        gen_context['past_key_values'] = past_key_values
+        return gen_context
+
+    @torch.no_grad()
     def update_context_image(self, image, gen_context, vae=True, vit=True):
         # used for interleave data, currently only support 1 data inference, 
 

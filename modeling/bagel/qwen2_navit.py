@@ -220,6 +220,145 @@ class NaiveCache:
         else:
             return 0
 
+    def clone(self) -> "NaiveCache":
+        """Return an independent copy of this cache. Per-layer K/V tensors are
+        `.clone()`d on whatever device they currently live on."""
+        new = NaiveCache(self.num_layers)
+        for layer_idx in range(self.num_layers):
+            k = self.key_cache[layer_idx]
+            v = self.value_cache[layer_idx]
+            new.key_cache[layer_idx] = k.clone() if k is not None else None
+            new.value_cache[layer_idx] = v.clone() if v is not None else None
+        return new
+
+    def fork(self, g: int) -> list:
+        """Return `g` independent clones of this cache. Used to share an
+        autoregressive prefix across `g` rollouts that diverge at sampling
+        time — each fork's K/V tensors can then grow without contaminating
+        the others. Total extra memory is `g × current_seq_len × layers ×
+        heads × head_dim × 2 (K,V) × dtype_size`. For BAGEL-7B at prefix
+        ≈ 600 tokens this is ≈ 60 MB per fork (≈ 480 MB for g=8 on bf16)."""
+        return [self.clone() for _ in range(g)]
+
+    @staticmethod
+    def concat(caches: list) -> "NaiveCache":
+        """Concatenate B per-sample caches into one packed cache. Per-layer
+        K/V are stacked along dim 0, preserving each sample's contiguous
+        slice. This matches the layout BAGEL's prepare_start_tokens /
+        forward_inference expect: sample b's K/V live at slots
+        [sum(L_0..L_{b-1}), sum(L_0..L_b)) in the packed cache.
+
+        All caches must have identical num_layers. A None layer in any input
+        propagates to a None layer in the output (i.e. the cache hasn't
+        been written to yet)."""
+        if not caches:
+            raise ValueError("concat requires at least one cache")
+        num_layers = caches[0].num_layers
+        out = NaiveCache(num_layers)
+        for layer_idx in range(num_layers):
+            ks = [c.key_cache[layer_idx] for c in caches]
+            vs = [c.value_cache[layer_idx] for c in caches]
+            if any(k is None for k in ks):
+                if not all(k is None for k in ks):
+                    raise ValueError(
+                        f"concat: layer {layer_idx} has mixed None / non-None tensors"
+                    )
+                out.key_cache[layer_idx] = None
+                out.value_cache[layer_idx] = None
+            else:
+                out.key_cache[layer_idx] = torch.cat(ks, dim=0)
+                out.value_cache[layer_idx] = torch.cat(vs, dim=0)
+        return out
+
+    def split(self, per_sample_lens: list) -> list:
+        """Split a UNIFORMLY-packed cache (all samples have the same packed
+        length) back into per-sample caches.
+
+        Use this for caches produced by `generate_text_batched`: every sample
+        was stepped the same number of times, so the cache is laid out as
+        `[sample 0's L_total slots, sample 1's L_total slots, ...]` with
+        `L_total = packed_len / B`. The `per_sample_lens` argument lets the
+        caller trim each sample's slice at its EFFECTIVE length (e.g. when
+        samples hit EOS at different steps, keeping `prefix_len + k_b`).
+
+        For caches whose per-sample lengths already differ (e.g. after
+        `forward_cache_update_text` with non-uniform label batches), use
+        `split_packed` instead — that variant slices by exclusive prefix
+        sums and tolerates non-uniform layouts."""
+        B = len(per_sample_lens)
+        if B == 0:
+            return []
+        out = [NaiveCache(self.num_layers) for _ in range(B)]
+        for layer_idx in range(self.num_layers):
+            k_packed = self.key_cache[layer_idx]
+            v_packed = self.value_cache[layer_idx]
+            if k_packed is None:
+                for b in range(B):
+                    out[b].key_cache[layer_idx] = None
+                    out[b].value_cache[layer_idx] = None
+                continue
+            total = k_packed.shape[0]
+            if total % B != 0:
+                raise ValueError(
+                    f"split: layer {layer_idx} packed length {total} not divisible by B={B}; "
+                    f"if the per-sample lengths already differ, use split_packed() instead."
+                )
+            per_sample_packed_len = total // B
+            for b in range(B):
+                if per_sample_lens[b] > per_sample_packed_len:
+                    raise ValueError(
+                        f"split: sample {b} requested {per_sample_lens[b]} tokens but "
+                        f"packed cache only has {per_sample_packed_len} per sample"
+                    )
+                start = b * per_sample_packed_len
+                end = start + per_sample_lens[b]
+                out[b].key_cache[layer_idx] = k_packed[start:end]
+                out[b].value_cache[layer_idx] = v_packed[start:end]
+        return out
+
+    def split_packed(self, per_sample_packed_lens: list) -> list:
+        """Split a NON-UNIFORMLY packed cache back into per-sample caches.
+
+        The packed cache must have a layout matching the convention used
+        by `prepare_token_ids` / `prepare_prompts`: sample b's K/V occupy
+        slots [exclusive_prefix_sum[b], exclusive_prefix_sum[b+1]) where
+        `exclusive_prefix_sum[b] = sum(per_sample_packed_lens[:b])`. Total
+        packed length must equal `sum(per_sample_packed_lens)`.
+
+        Use this after `forward_cache_update_text` writes per-sample label
+        sequences of differing lengths (e.g. when batched generation hit
+        EOS at different steps and the labels were re-packed into the
+        cache via one call to `forward_cache_update_text`)."""
+        B = len(per_sample_packed_lens)
+        if B == 0:
+            return []
+        # Exclusive prefix sum.
+        offsets = [0]
+        for L in per_sample_packed_lens:
+            offsets.append(offsets[-1] + L)
+        expected_total = offsets[-1]
+
+        out = [NaiveCache(self.num_layers) for _ in range(B)]
+        for layer_idx in range(self.num_layers):
+            k_packed = self.key_cache[layer_idx]
+            v_packed = self.value_cache[layer_idx]
+            if k_packed is None:
+                for b in range(B):
+                    out[b].key_cache[layer_idx] = None
+                    out[b].value_cache[layer_idx] = None
+                continue
+            total = k_packed.shape[0]
+            if total != expected_total:
+                raise ValueError(
+                    f"split_packed: layer {layer_idx} packed length {total} != "
+                    f"sum(per_sample_packed_lens)={expected_total}"
+                )
+            for b in range(B):
+                start, end = offsets[b], offsets[b + 1]
+                out[b].key_cache[layer_idx] = k_packed[start:end]
+                out[b].value_cache[layer_idx] = v_packed[start:end]
+        return out
+
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):

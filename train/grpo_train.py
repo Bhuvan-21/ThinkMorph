@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from time import time
 
@@ -51,6 +51,11 @@ from train.train_utils import create_logger, get_latest_ckpt
 from train.grpo_rewards import get_reward_fn
 from train.grpo_rollout import GRPORolloutGenerator
 from train.grpo_loss import compute_grpo_loss, compute_advantages
+from train.grpo_packer import pack_rollout_for_log_probs
+from train.grpo_profiler import CudaPhaseTimer, make_profiler, format_phase_table
+
+from contextlib import contextmanager
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +149,23 @@ class TrainingArguments:
     save_every: int = field(default=100)
     total_steps: int = field(default=2000)
 
+    # Profiling
+    profile_steps: int = field(default=0,
+        metadata={"help": "If >0, enable per-phase cuda.Event timing, "
+                          "auto-disable wandb, and early-exit after "
+                          "(profile_steps + 2) training steps (wait + warmup + active). "
+                          "The Chrome trace is only exported when "
+                          "--enable_chrome_trace True is also passed — the chrome "
+                          "exporter consumed >480 GB RAM in a prior 4-step run "
+                          "(see plan.md), so default is OFF."})
+    enable_chrome_trace: bool = field(default=False,
+        metadata={"help": "Export a torch.profiler Chrome trace to "
+                          "{results_dir}/profile_trace.json. Requires "
+                          "--profile_steps > 0. WARNING: high RAM cost — see plan.md."})
+    phase_timing: bool = field(default=False,
+        metadata={"help": "Always-on cheap cuda.Event-based per-phase timing "
+                          "logged to logger + wandb. Implied by --profile_steps>0."})
+
     warmup_steps: int = field(default=50)
     lr_scheduler: str = field(default="cosine")
     lr: float = field(default=1e-5)
@@ -159,42 +181,50 @@ class TrainingArguments:
 
 
 # ---------------------------------------------------------------------------
-# Reference model management: LoRA weight swapping
+# Reference policy via PEFT adapter disable (no weight movement)
 # ---------------------------------------------------------------------------
+#
+# The KL reference for GRPO is the SFT-merged base model — i.e. the policy
+# *before* this GRPO run started. With PEFT's default init lora_B = 0, so
+# `base_layer(x) + lora_B(lora_A(x)) * scaling == base_layer(x)` always.
+# The reference forward is therefore mathematically equivalent to "run the
+# forward with LoRA adapters disabled", which `BaseTunerLayer.forward`
+# (peft/tuners/lora/layer.py:941) supports natively via `self.disable_adapters`:
+#
+#     if self.disable_adapters:
+#         result = self.base_layer(x, *args, **kwargs)
+#     else:
+#         result = self.base_layer(x, ...) + lora_B(lora_A(...)) * scaling
+#
+# Flipping that flag is an O(num_lora_layers) Python attribute write — zero
+# tensor ops, zero PCIe traffic. The previous `LoRAReference.swap_to_*`
+# approach moved every LoRA tensor CPU↔GPU each ref forward (≈6 s per swap
+# × G rollouts = 48 s/step lost; see plan.md profiling notes).
+#
+# Invariant carried over from the old code: the base weights in memory must
+# equal the SFT policy at training start. That's enforced by
+# `finetune_from_hf=True` loading SFT weights into the base before the LoRA
+# adapter is injected; resuming a GRPO checkpoint then overwrites only the
+# (now-nonzero) LoRA tensors, leaving the base untouched, so disabling the
+# adapter still yields SFT logits.
 
-class LoRAReference:
-    """
-    Manages a frozen reference copy of LoRA weights for KL computation.
-
-    Stores reference LoRA weights on CPU and swaps them into the model
-    in-place when needed, to avoid keeping two full models on GPU.
-    """
-
-    def __init__(self, model):
-        """Snapshot current LoRA weights as the reference."""
-        unwrapped = model.module if isinstance(model, DDP) else model
-        self._ref_weights = {}
-        self._policy_weights = {}
-        for name, param in unwrapped.language_model.named_parameters():
-            if "lora_" in name:
-                self._ref_weights[name] = param.data.detach().cpu().clone()
-
-    def swap_to_reference(self, model):
-        """Replace current LoRA weights with reference weights."""
-        unwrapped = model.module if isinstance(model, DDP) else model
-        self._policy_weights.clear()
-        for name, param in unwrapped.language_model.named_parameters():
-            if "lora_" in name:
-                self._policy_weights[name] = param.data.detach().cpu().clone()
-                param.data.copy_(self._ref_weights[name].to(param.device))
-
-    def swap_to_policy(self, model):
-        """Restore current LoRA weights from the snapshot."""
-        unwrapped = model.module if isinstance(model, DDP) else model
-        for name, param in unwrapped.language_model.named_parameters():
-            if "lora_" in name and name in self._policy_weights:
-                param.data.copy_(self._policy_weights[name].to(param.device))
-        self._policy_weights.clear()
+@contextmanager
+def disable_lora_adapters(model):
+    """Disable every LoRA `BaseTunerLayer` in `model` for the duration of the
+    `with` block. The forward path short-circuits to `base_layer(x)` while
+    disabled. On exit, only layers that were enabled on entry are re-enabled
+    (so nested calls are safe). Does NOT touch `param.requires_grad` — the
+    caller is responsible (we wrap this in `torch.no_grad()`)."""
+    flipped = []
+    for module in model.modules():
+        if isinstance(module, BaseTunerLayer) and not module._disable_adapters:
+            module._disable_adapters = True
+            flipped.append(module)
+    try:
+        yield
+    finally:
+        for module in flipped:
+            module._disable_adapters = False
 
 
 # ---------------------------------------------------------------------------
@@ -254,65 +284,31 @@ def load_grpo_checkpoint(resume_from, model, optimizer, scheduler, logger):
 # Policy update: compute log-probs for a generated sequence
 # ---------------------------------------------------------------------------
 
-def compute_sequence_log_probs(model, tokenizer, new_token_ids, prompt_text, generated_text,
-                               input_image=None, vae_model=None, vae_transform=None,
-                               vit_transform=None):
+
+def compute_rollout_log_probs(
+    model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids, rollout
+):
     """
-    Compute per-token log-probs for generated_text conditioned on prompt_text
-    and optional input_image.
+    Teacher-force the model over the rollout's *exact* sampled token IDs,
+    conditioned on the SAME image and text context the model saw at rollout
+    time, and return per-token log-probs aligned 1-1 with
+    `rollout.per_token_log_probs`.
 
-    This re-encodes the full sequence (prompt + generation) and runs the model's
-    compute_text_log_probs method. Only returns log-probs for the generated
-    tokens (not the prompt).
-
-    Returns:
-        log_probs: 1-D tensor of shape (num_generated_tokens,)
+    The single-shot packed forward replaces the previous text-only,
+    decode-then-re-encode approach which produced curr_lps != old_lps even
+    when the LoRA weights were unchanged (giving spurious clip-frac ≈ 0.7
+    at step 0).
     """
     unwrapped = model.module if isinstance(model, DDP) else model
-
-    # Tokenize
-    prompt_ids = tokenizer.encode(prompt_text)
-    gen_ids = tokenizer.encode(generated_text)
-    full_ids = [new_token_ids['bos_token_id']] + prompt_ids + gen_ids + [new_token_ids['eos_token_id']]
-
-    num_prompt_tokens = 1 + len(prompt_ids)  # bos + prompt
-    num_gen_tokens = len(gen_ids)
-
-    # Build packed tensors for a single sample
-    device = next(unwrapped.parameters()).device
-    packed_text_ids = torch.tensor(full_ids, dtype=torch.long, device=device)
-    seq_len = len(full_ids)
-    packed_text_indexes = torch.arange(seq_len, dtype=torch.long, device=device)
-    packed_position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
-    sample_lens = [seq_len]
-
-    # CE loss indexes: only for generated tokens (shifted by 1 for next-token prediction)
-    ce_loss_indexes = torch.zeros(seq_len, dtype=torch.bool, device=device)
-    ce_start = num_prompt_tokens
-    ce_end = num_prompt_tokens + num_gen_tokens
-    ce_loss_indexes[ce_start:ce_end] = True
-
-    # Labels: the token at each CE position predicts the next token
-    label_positions = list(range(ce_start + 1, ce_end + 1))
-    label_ids = [full_ids[p] if p < len(full_ids) else new_token_ids['eos_token_id'] for p in label_positions]
-    packed_label_ids = torch.tensor(label_ids, dtype=torch.long, device=device)
-
-    # Build attention mask (causal, single sample)
-    attn_mask = torch.zeros(seq_len, seq_len, device=device)
-    causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
-    attn_mask = causal_mask
-
-    log_probs = unwrapped.compute_text_log_probs(
-        sequence_length=seq_len,
-        packed_text_ids=packed_text_ids,
-        packed_text_indexes=packed_text_indexes,
-        sample_lens=sample_lens,
-        packed_position_ids=packed_position_ids,
-        nested_attention_masks=[attn_mask],
-        ce_loss_indexes=ce_loss_indexes,
-        packed_label_ids=packed_label_ids,
+    packed = pack_rollout_for_log_probs(
+        rollout, unwrapped, vae_model, tokenizer,
+        vae_transform, vit_transform, new_token_ids,
     )
-
+    num_gen_tokens = packed.pop("_num_gen_tokens")
+    log_probs = unwrapped.compute_text_log_probs(**packed)
+    assert log_probs.shape[0] == num_gen_tokens, (
+        f"log_probs has {log_probs.shape[0]} entries but expected {num_gen_tokens}"
+    )
     return log_probs
 
 
@@ -327,7 +323,18 @@ def main():
     assert torch.cuda.is_available()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    # GRPO rollouts have highly variable wall-clock per rank (different prompts
+    # → different generation lengths and image-gen rounds). The default 10-min
+    # NCCL watchdog timeout is far too tight: a rank that draws a long prompt
+    # can be many minutes behind ranks that drew short ones when they finally
+    # meet at the gradient AllReduce, which trips the watchdog and aborts the
+    # job. Override via NCCL_TIMEOUT_MINUTES.
+    nccl_timeout_minutes = int(os.environ.get("NCCL_TIMEOUT_MINUTES", "120"))
+    dist.init_process_group(
+        "nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=timedelta(minutes=nccl_timeout_minutes),
+    )
     rank = dist.get_rank()
     device = local_rank
     world_size = dist.get_world_size()
@@ -335,19 +342,35 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, GRPOArguments, TrainingArguments))
     model_args, data_args, grpo_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Profiling implies phase timing and forces wandb off so the trace isn't
+    # polluted by network I/O and so noisy timings don't pollute the run.
+    profiling_active = training_args.profile_steps > 0
+    if profiling_active:
+        training_args.phase_timing = True
+
     if rank == 0:
         os.makedirs(training_args.results_dir, exist_ok=True)
         os.makedirs(training_args.checkpoint_dir, exist_ok=True)
-        wandb.init(
-            project=training_args.wandb_project,
-            id=wandb.util.generate_id(),
-            name=f"{training_args.wandb_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-            mode="offline" if training_args.wandb_offline else "online",
-        )
-        wandb.config.update({
-            **vars(model_args), **vars(training_args),
-            **vars(data_args), **vars(grpo_args),
-        })
+        if profiling_active:
+            # Use the "disabled" mode so wandb.log calls are no-ops without
+            # needing to guard each callsite.
+            wandb.init(
+                project=training_args.wandb_project,
+                id=wandb.util.generate_id(),
+                name=f"{training_args.wandb_name}-profile",
+                mode="disabled",
+            )
+        else:
+            wandb.init(
+                project=training_args.wandb_project,
+                id=wandb.util.generate_id(),
+                name=f"{training_args.wandb_name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                mode="offline" if training_args.wandb_offline else "online",
+            )
+            wandb.config.update({
+                **vars(model_args), **vars(training_args),
+                **vars(data_args), **vars(grpo_args),
+            })
 
     logger = create_logger(training_args.results_dir if rank == 0 else None, rank)
     dist.barrier()
@@ -436,6 +459,22 @@ def main():
 
     # ── LoRA injection ───────────────────────────────────────────────────────
     target_modules = [m.strip() for m in model_args.lora_target_modules.split(",")]
+    # LoRA dropout is mathematically incompatible with on-policy importance
+    # sampling: it makes π(·|s) a stochastic function of the *forward pass*
+    # (not just the weights), so curr_lps and old_lps are drawn from different
+    # realizations even when the parameters are identical → the GRPO ratio
+    # exp(curr - old) ≠ 1 at step 0 and the clip term fires on noise instead
+    # of on actual policy drift. (Empirically: with dropout=0.05 we observed
+    # clip_fraction≈0.70 and policy_loss≈160 at step 0, both ~0 in theory.)
+    # We force it to 0 here regardless of what the launcher passed, and warn
+    # so the user notices if they tried to set it.
+    if model_args.lora_dropout != 0.0:
+        if rank == 0:
+            logger.warning(
+                f"lora_dropout={model_args.lora_dropout} is unsafe for GRPO "
+                f"(breaks importance sampling); forcing to 0.0."
+            )
+        model_args.lora_dropout = 0.0
     lora_config = LoraConfig(
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
@@ -532,24 +571,14 @@ def main():
     if training_args.visual_gen:
         vae_model.to(device=device, dtype=torch.bfloat16).eval()
 
-    # ── Reference model (frozen LoRA snapshot) ───────────────────────────────
-    # The KL reference for GRPO is the SFT-merged base model — i.e. the policy
-    # *before* this GRPO run started. With PEFT's default init, lora_A is
-    # kaiming and lora_B is zero, so the freshly-injected adapter contributes
-    # nothing to logits and "the model right now" *is* the SFT policy.
-    # We snapshot here, BEFORE load_grpo_checkpoint runs, so a resumed run
-    # still uses the SFT model (not the previous checkpoint) as its reference
-    # — otherwise resumes would compound KL drift across runs.
-    unwrapped = model.module if isinstance(model, DDP) else model
-    for n, p in unwrapped.language_model.named_parameters():
-        if "lora_B" in n:
-            assert torch.all(p == 0), (
-                f"LoRA reference invariant violated: {n} is not zero at snapshot "
-                f"time. The KL reference would no longer equal the SFT model."
-            )
-    lora_ref = LoRAReference(model)
-    logger.info("Reference LoRA weights captured for KL regularization")
-
+    # ── Reference policy: see `disable_lora_adapters` definition above. ───
+    # No snapshot, no CPU↔GPU swap. The base weights in memory are the SFT
+    # policy (loaded via finetune_from_hf), and disabling the LoRA adapter
+    # at ref-forward time recovers exactly those base-model logits. This
+    # holds across resumes because GRPO checkpoints only modify LoRA + the
+    # explicitly-trainable non-LoRA heads (connector / vae2llm / llm2vae),
+    # never the base transformer weights.
+    #
     # No DDP wrap. GRPO's policy update issues a variable number of backward()
     # calls per rank (rollouts are filtered by reward variance, generation length,
     # forward-failure exceptions, etc.), which breaks DDP's implicit assumption
@@ -608,10 +637,36 @@ def main():
     unwrapped = model.module if isinstance(model, DDP) else model
     vae_transform = ImageTransform(max_image_size=1024, min_image_size=512, image_stride=16)
     vit_xform = ImageTransform(max_image_size=518, min_image_size=224, image_stride=14)
+    timer = CudaPhaseTimer(enabled=training_args.phase_timing)
     rollout_gen = GRPORolloutGenerator(
         unwrapped, vae_model, tokenizer, vae_transform, vit_xform, new_token_ids,
+        timer=timer,
     )
     reward_fn = get_reward_fn(grpo_args.reward_type)
+
+    # ── Optional torch.profiler (disables wandb above; rank-0 only trace) ───
+    # Phase timing (cheap) is always on when profiling_active. Chrome trace
+    # is opt-in via --enable_chrome_trace because the exporter is RAM-greedy
+    # (>480 GB observed for a 4-step run; see plan.md).
+    profiler = None
+    if profiling_active and training_args.enable_chrome_trace and rank == 0:
+        profiler = make_profiler(
+            output_dir=training_args.results_dir,
+            active_steps=training_args.profile_steps,
+            wait_steps=1,
+            warmup_steps=1,
+        )
+        profiler.__enter__()
+        logger.info(
+            f"torch.profiler armed: wait=1, warmup=1, active={training_args.profile_steps}; "
+            f"trace will be written to {training_args.results_dir}/profile_trace.json"
+        )
+    elif profiling_active:
+        logger.info(
+            f"Phase-timing profiling enabled (profile_steps={training_args.profile_steps}); "
+            f"Chrome trace NOT exported (enable_chrome_trace=False). "
+            f"Wandb disabled; early-exit after {training_args.profile_steps + 2} steps."
+        )
 
     # ── Training loop ────────────────────────────────────────────────────────
     model.train()
@@ -635,15 +690,20 @@ def main():
         accum_clip_frac = 0.0
         accum_completions = 0
         accum_skipped = 0
+        # Rollout shape stats (for sizing decisions in Phase 4)
+        rollout_text_lens: list = []      # per-completion total gen-text tokens
+        rollout_round_counts: list = []   # per-completion num_rounds
+        rollout_image_counts: list = []   # per-completion images generated
 
         # Each optimizer step processes `accum_steps` prompts
         for micro in range(accum_steps):
             # ── Fetch a sample ──────────────────────────────────────────
-            try:
-                sample = next(data_iter)
-            except StopIteration:
-                data_iter = iter(train_loader)
-                sample = next(data_iter)
+            with timer.time("data_fetch"):
+                try:
+                    sample = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(train_loader)
+                    sample = next(data_iter)
 
             prompt = sample["prompt"][0]
             input_image = sample["input_image"][0] if "input_image" in sample else None
@@ -651,28 +711,32 @@ def main():
 
             # ── Phase 1: Rollout generation (no grad) ──────────────────
             model.eval()
-            with torch.no_grad():
-                rollouts = rollout_gen.generate_rollouts(
-                    prompt=prompt,
-                    input_image=input_image,
-                    group_size=grpo_args.group_size,
-                    think=True,
-                    understanding_output=False,
-                    max_think_token_n=grpo_args.max_think_tokens,
-                    do_sample=True,
-                    text_temperature=grpo_args.temperature,
-                    cfg_text_scale=grpo_args.cfg_text_scale,
-                    cfg_img_scale=grpo_args.cfg_img_scale,
-                    num_timesteps=grpo_args.num_timesteps,
-                    timestep_shift=grpo_args.timestep_shift,
-                    max_rounds=grpo_args.max_rounds,
-                )
+            with timer.time("rollout_total"):
+                with torch.no_grad():
+                    rollouts = rollout_gen.generate_rollouts(
+                        prompt=prompt,
+                        input_image=input_image,
+                        group_size=grpo_args.group_size,
+                        think=True,
+                        understanding_output=False,
+                        max_think_token_n=grpo_args.max_think_tokens,
+                        do_sample=True,
+                        text_temperature=grpo_args.temperature,
+                        cfg_text_scale=grpo_args.cfg_text_scale,
+                        cfg_img_scale=grpo_args.cfg_img_scale,
+                        num_timesteps=grpo_args.num_timesteps,
+                        timestep_shift=grpo_args.timestep_shift,
+                        max_rounds=grpo_args.max_rounds,
+                    )
 
             # Score completions
             rewards_list = []
             for rollout in rollouts:
                 r = reward_fn(rollout.generated_text, gt_answer)
                 rewards_list.append(r)
+                rollout_text_lens.append(len(rollout.generated_token_ids))
+                rollout_round_counts.append(rollout.num_rounds)
+                rollout_image_counts.append(len(rollout.generated_images))
             rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
             advantages = compute_advantages(rewards)
 
@@ -701,46 +765,77 @@ def main():
 
             for g_idx, rollout in enumerate(rollouts):
                 if not rollout.generated_token_ids:
+                    logger.warning(
+                        f"(step={curr_step} g={g_idx}) Empty rollout trace: "
+                        f"trace_len={len(rollout.trace)}, "
+                        f"kinds={[s.kind for s in rollout.trace]}, "
+                        f"gen_text_seg_count={sum(1 for s in rollout.trace if s.kind=='gen_text')}"
+                    )
                     continue
 
                 adv = advantages[g_idx]
                 old_lps = torch.tensor(rollout.per_token_log_probs, device=device, dtype=torch.float32)
 
-                # Current policy log-probs (with grad)
+                # Current policy log-probs (with grad). Replays the rollout
+                # trace token-for-token with image conditioning intact.
                 try:
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        curr_lps = compute_sequence_log_probs(
-                            model, tokenizer, new_token_ids,
-                            prompt_text=prompt,
-                            generated_text=rollout.generated_text,
-                        )
+                    with timer.time("policy_curr_forward"):
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            curr_lps = compute_rollout_log_probs(
+                                model, vae_model, tokenizer,
+                                vae_transform, vit_xform, new_token_ids, rollout,
+                            )
                 except Exception as e:
-                    logger.warning(f"(step={curr_step}) Policy forward failed for rollout {g_idx}: {e}")
+                    import traceback
+                    logger.warning(
+                        f"(step={curr_step} g={g_idx}) Policy forward failed: {type(e).__name__}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
                     continue
 
-                # Truncate to matching length
+                # Should match by construction, but guard against
+                # length skew from a corrupted trace.
                 min_len = min(len(curr_lps), len(old_lps))
                 if min_len == 0:
+                    logger.warning(
+                        f"(step={curr_step} g={g_idx}) Zero-length log-probs: "
+                        f"curr_lps={len(curr_lps)}, old_lps={len(old_lps)}, "
+                        f"trace_kinds={[s.kind for s in rollout.trace]}"
+                    )
                     continue
+                if g_idx == 0 and micro == 0 and curr_step == train_step:
+                    # One-shot sanity log at the very first successful rollout.
+                    logger.info(
+                        f"[sanity] curr_lps={len(curr_lps)}, old_lps={len(old_lps)}, "
+                        f"trace_segs={len(rollout.trace)}, "
+                        f"gen_text_segs={sum(1 for s in rollout.trace if s.kind=='gen_text')}, "
+                        f"first_curr_lp={curr_lps[0].item():.4f}, "
+                        f"first_old_lp={old_lps[0].item():.4f}, "
+                        f"max_abs_diff={(curr_lps.detach().float()-old_lps.float()).abs().max().item():.4f}"
+                    )
                 curr_lps = curr_lps[:min_len]
                 old_lps = old_lps[:min_len]
 
-                # Reference policy log-probs (no grad)
-                with torch.no_grad():
-                    lora_ref.swap_to_reference(model)
-                    try:
-                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                            ref_lps = compute_sequence_log_probs(
-                                model, tokenizer, new_token_ids,
-                                prompt_text=prompt,
-                                generated_text=rollout.generated_text,
+                # Reference policy log-probs (no grad). The reference policy
+                # is the SFT base model — recovered by disabling the LoRA
+                # adapter (replaces the old CPU↔GPU lora-weight swap, see
+                # plan.md F4 and the `disable_lora_adapters` docstring).
+                try:
+                    with timer.time("policy_ref_forward"):
+                        with torch.no_grad(), disable_lora_adapters(model), \
+                             torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                            ref_lps = compute_rollout_log_probs(
+                                model, vae_model, tokenizer,
+                                vae_transform, vit_xform, new_token_ids, rollout,
                             )
-                    except Exception as e:
-                        logger.warning(f"(step={curr_step}) Ref forward failed for rollout {g_idx}: {e}")
-                        lora_ref.swap_to_policy(model)
-                        continue
-                    lora_ref.swap_to_policy(model)
-                    ref_lps = ref_lps[:min_len].detach()
+                except Exception as e:
+                    import traceback
+                    logger.warning(
+                        f"(step={curr_step} g={g_idx}) Ref forward failed: {type(e).__name__}: {e}\n"
+                        f"{traceback.format_exc()}"
+                    )
+                    continue
+                ref_lps = ref_lps[:min_len].detach()
 
                 # Broadcast advantage to per-token
                 adv_tokens = adv.expand(min_len)
@@ -757,7 +852,8 @@ def main():
                 )
 
                 scaled_loss = loss_dict["loss"] * loss_scale
-                scaled_loss.backward()
+                with timer.time("backward"):
+                    scaled_loss.backward()
 
                 accum_policy_loss += loss_dict["policy_loss"].item()
                 accum_kl += loss_dict["kl_loss"].item()
@@ -772,21 +868,22 @@ def main():
         # collective count to O(1) instead of O(num_params).
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if world_size > 1:
-            for p in trainable_params:
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p)
-            buckets = {}
-            for p in trainable_params:
-                buckets.setdefault(p.grad.dtype, []).append(p)
-            for dtype, ps in buckets.items():
-                flat = torch.cat([p.grad.detach().flatten() for p in ps])
-                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                flat.div_(world_size)
-                offset = 0
-                for p in ps:
-                    n = p.grad.numel()
-                    p.grad.copy_(flat[offset:offset + n].view_as(p.grad))
-                    offset += n
+            with timer.time("grad_allreduce"):
+                for p in trainable_params:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+                buckets = {}
+                for p in trainable_params:
+                    buckets.setdefault(p.grad.dtype, []).append(p)
+                for dtype, ps in buckets.items():
+                    flat = torch.cat([p.grad.detach().flatten() for p in ps])
+                    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                    flat.div_(world_size)
+                    offset = 0
+                    for p in ps:
+                        n = p.grad.numel()
+                        p.grad.copy_(flat[offset:offset + n].view_as(p.grad))
+                        offset += n
 
         # Decide globally whether to step the optimizer + scheduler. Both must
         # be called consistently on every rank to keep LR schedules aligned.
@@ -797,10 +894,16 @@ def main():
             global_completions = int(t.item())
 
         if global_completions > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, training_args.max_grad_norm)
-            optimizer.step()
-            scheduler.step()
+            with timer.time("optimizer_step"):
+                torch.nn.utils.clip_grad_norm_(trainable_params, training_args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
         optimizer.zero_grad()
+
+        # Advance the profiler schedule (if any). Must happen exactly once
+        # per train_step regardless of whether the optimizer fired.
+        if profiler is not None:
+            profiler.step()
 
         # ── Logging ──────────────────────────────────────────────────────
         if curr_step % training_args.log_every == 0:
@@ -846,8 +949,30 @@ def main():
                 f"Steps/Sec: {steps_per_sec:.3f}"
             )
             logger.info(msg)
+
+            # ── Per-phase wall-clock + rollout shape stats ────────────────
+            phase_stats = timer.flush()
+            if phase_stats:
+                logger.info(format_phase_table(phase_stats))
+            if rollout_text_lens:
+                import statistics
+                txt_lens_sorted = sorted(rollout_text_lens)
+                rounds_sorted = sorted(rollout_round_counts)
+                pct = lambda xs, p: xs[min(len(xs) - 1, int(len(xs) * p))]
+                logger.info(
+                    f"rollout_shape: text_tokens "
+                    f"mean={statistics.mean(rollout_text_lens):.0f} "
+                    f"p50={pct(txt_lens_sorted, 0.5)} "
+                    f"p95={pct(txt_lens_sorted, 0.95)} "
+                    f"max={txt_lens_sorted[-1]} | "
+                    f"num_rounds mean={statistics.mean(rollout_round_counts):.2f} "
+                    f"p50={pct(rounds_sorted, 0.5)} "
+                    f"p95={pct(rounds_sorted, 0.95)} | "
+                    f"images_per_completion mean={statistics.mean(rollout_image_counts):.2f}"
+                )
+
             if rank == 0:
-                wandb.log({
+                log_dict = {
                     "reward_mean": r_mean,
                     "policy_loss": g_policy_loss / n,
                     "kl_divergence": g_kl / n,
@@ -856,7 +981,16 @@ def main():
                     "num_skipped": g_skipped,
                     "lr": optimizer.param_groups[0]["lr"],
                     "mem_allocated_MB": torch.cuda.max_memory_allocated() / 1024**2,
-                }, step=curr_step)
+                }
+                for phase, (total_ms, count, mean_ms) in phase_stats.items():
+                    log_dict[f"time/{phase}_ms"] = total_ms
+                    log_dict[f"time/{phase}_count"] = count
+                if rollout_text_lens:
+                    log_dict["rollout/text_tokens_mean"] = sum(rollout_text_lens) / len(rollout_text_lens)
+                    log_dict["rollout/text_tokens_max"] = max(rollout_text_lens)
+                    log_dict["rollout/num_rounds_mean"] = sum(rollout_round_counts) / len(rollout_round_counts)
+                    log_dict["rollout/images_per_completion_mean"] = sum(rollout_image_counts) / len(rollout_image_counts)
+                wandb.log(log_dict, step=curr_step)
 
             start_time = time()
 
@@ -867,11 +1001,29 @@ def main():
                 training_args.checkpoint_dir, logger, rank,
             )
 
-    # Final checkpoint
-    save_grpo_checkpoint(
-        training_args.total_steps, model, optimizer, scheduler,
-        training_args.checkpoint_dir, logger, rank,
-    )
+        # Early-exit once the profiler has captured all `active` steps. The
+        # schedule is 1 wait + 1 warmup + N active, so we stop one step after
+        # the active window closes.
+        if profiling_active and curr_step >= training_args.profile_steps + 1:
+            logger.info(
+                f"Profiling complete: captured {training_args.profile_steps} active "
+                f"steps. Exiting early without final checkpoint."
+            )
+            break
+
+    # Tear down the profiler (writes the chrome trace via on_trace_ready).
+    if profiler is not None:
+        profiler.__exit__(None, None, None)
+        logger.info(
+            f"Profiler trace written under {training_args.results_dir}/profile_trace.json"
+        )
+
+    if not profiling_active:
+        # Final checkpoint
+        save_grpo_checkpoint(
+            training_args.total_steps, model, optimizer, scheduler,
+            training_args.checkpoint_dir, logger, rank,
+        )
     logger.info("GRPO+LoRA training complete.")
     if rank == 0:
         wandb.finish()

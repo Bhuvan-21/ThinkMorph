@@ -16,29 +16,29 @@ cd "$(dirname "$(realpath "$0")")/.."   # always run from project root
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_PATH="${MODEL_PATH:-/workspace/bagel-lora-merged-8K}"
+MODEL_PATH="${MODEL_PATH:-/workspace/bagel-merged-subset/2500}"
 LLM_PATH="${LLM_PATH:-hf/Qwen2.5-7B-Instruct}"
-VAE_PATH="${VAE_PATH:-/workspace/bagel-lora-merged-8K/ae.safetensors}"
+VAE_PATH="${VAE_PATH:-/workspace/bagel-merged-subset/2500/ae.safetensors}"
 VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
 
 # ── Data & output ─────────────────────────────────────────────────────────────
 DATASET_CONFIG="${DATASET_CONFIG:-data/configs/grpo_interleaved.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo}"
-CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo/checkpoints/dropout_fixed}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset}"
+CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset/checkpoints}"
 RESUME_FROM="${RESUME_FROM:-}"
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-grpo-8xb200}"
-WANDB_NAME="${WANDB_NAME:-grpo-interleaved}"
+WANDB_NAME="${WANDB_NAME:-grpo-interleaved-optimized}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 # ── GRPO hyperparameters ──────────────────────────────────────────────────────
-GROUP_SIZE="${GROUP_SIZE:-16}"
+GROUP_SIZE="${GROUP_SIZE:-8}"
 CLIP_EPSILON="${CLIP_EPSILON:-0.2}"
 KL_WEIGHT="${KL_WEIGHT:-0.01}"
 REWARD_TYPE="${REWARD_TYPE:-exact_match}"
 TEMPERATURE="${TEMPERATURE:-0.9}"
-MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-16384}"
+MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-8192}"
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-50}"
 LOG_SKIPPED="${LOG_SKIPPED:-true}"
@@ -54,7 +54,11 @@ GRADIENT_ACCUM="${GRADIENT_ACCUM:-1}"
 # ── LoRA hyperparameters ──────────────────────────────────────────────────────
 LORA_R="${LORA_R:-64}"
 LORA_ALPHA="${LORA_ALPHA:-128}"
-LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+# GRPO requires lora_dropout=0: stochastic dropout makes the importance ratio
+# exp(log π_curr − log π_old) ≠ 1 at step 0 even with identical weights, so the
+# clipped surrogate fires on noise (we saw clip_frac≈0.7 at step 0 with 0.05).
+# train/grpo_train.py also force-zeros this with a warning.
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen}"
 
 # ── Distributed settings ──────────────────────────────────────────────────────
@@ -63,6 +67,10 @@ NODE_RANK="${NODE_RANK:-0}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"   # 1 = single GPU
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29501}"
+# GRPO rollouts vary in wall-clock per rank; bump the NCCL watchdog well past
+# its 10-min default so the slowest rank's rollouts don't trip ALLREDUCE
+# timeouts at the gradient sync. Read by train/grpo_train.py.
+export NCCL_TIMEOUT_MINUTES="${NCCL_TIMEOUT_MINUTES:-120}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 RESUME_ARG=""
@@ -113,7 +121,7 @@ torchrun \
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUM}" \
   --log_every 1 \
-  --save_every 100 \
+  --save_every 200 \
   \
   --lora_r "${LORA_R}" \
   --lora_alpha "${LORA_ALPHA}" \

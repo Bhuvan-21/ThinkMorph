@@ -291,6 +291,11 @@ class Bagel(PreTrainedModel):
             packed_vit_token_embed = self.connector(packed_vit_token_embed)
             vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
+            # Mirror forward_cache_update_vit's dtype guard: the connector +
+            # pos_embed path can return fp32 while packed_sequence is bf16
+            # under autocast.
+            if packed_vit_token_embed.dtype != packed_sequence.dtype:
+                packed_vit_token_embed = packed_vit_token_embed.to(packed_sequence.dtype)
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
         if self.config.visual_gen and padded_latent is not None and packed_vae_token_indexes is not None:
@@ -308,6 +313,9 @@ class Bagel(PreTrainedModel):
             )
             latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
             packed_latent_embed = self.vae2llm(packed_latent_clean) + packed_timestep_embeds + latent_token_pos_emb
+            # Mirror forward_cache_update_vae's dtype guard.
+            if packed_latent_embed.dtype != packed_sequence.dtype:
+                packed_latent_embed = packed_latent_embed.to(packed_sequence.dtype)
             packed_sequence[packed_vae_token_indexes] = packed_latent_embed
 
         extra_inputs = {}
@@ -351,6 +359,50 @@ class Bagel(PreTrainedModel):
 
             text_ids = tokenizer.encode(prompt)
             text_ids = [new_token_ids['bos_token_id']] + text_ids + [new_token_ids['eos_token_id']]
+            text_token_lens.append(len(text_ids))
+            packed_text_ids.extend(text_ids)
+            packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
+            packed_text_indexes.extend(range(curr, curr + len(text_ids)))
+            newlens.append(curr_kvlen + len(text_ids))
+            new_rope.append(curr_position_id + len(text_ids))
+            curr += len(text_ids)
+
+        generation_input = {
+            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_position_ids": torch.tensor(packed_text_position_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+        }
+
+        return generation_input, newlens, new_rope
+
+    def prepare_token_ids(self, curr_kvlens, curr_rope, token_ids_list, new_token_ids):
+        """
+        Like `prepare_prompts`, but takes pre-tokenized integer IDs and does NOT
+        add BOS/EOS wrappers. Used for re-injecting model-sampled token sequences
+        into the KV cache (e.g. inter-round conditioning in GRPO rollouts) so
+        the cache contains exactly the IDs the model produced, not a re-tokenized
+        round-trip.
+
+        Args:
+            token_ids_list: list of List[int], one inner list per sample.
+        """
+        del new_token_ids  # unused; kept for signature symmetry with prepare_prompts
+        packed_text_ids = list()
+        packed_text_position_ids = list()
+        text_token_lens = list()
+        packed_text_indexes = list()
+        packed_key_value_indexes = list()
+
+        curr = 0
+        newlens, new_rope = list(), list()
+        for ids, curr_kvlen, curr_position_id in zip(token_ids_list, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            text_ids = list(ids)
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
             packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
@@ -996,16 +1048,45 @@ class Bagel(PreTrainedModel):
                 else:
                     v_t_ = v_t_text_
 
-                # NOTE norm is computed over all dimensions, thus currently only supports batch_size = 1 with navit
+                # NOTE original code did `torch.norm(v_t)` which folds the
+                # norm across the WHOLE packed tensor — correct for batch=1
+                # but wrong for B>1 (it mixes samples' norms). To support
+                # batched image-gen across G rollouts, we split by per-sample
+                # image-token counts (`packed_seqlens - 2`, dropping each
+                # sample's start/end-of-image markers) and compute the norm
+                # per sample, then broadcast the scaling factor back.
                 if cfg_renorm_type == "global":
-                    norm_v_t = torch.norm(v_t)
-                    norm_v_t_ = torch.norm(v_t_)
+                    per_sample_tok_counts = (packed_seqlens - 2).tolist()
+                    if len(per_sample_tok_counts) == 1:
+                        # Fast path: single sample, identical to the original code.
+                        norm_v_t = torch.norm(v_t)
+                        norm_v_t_ = torch.norm(v_t_)
+                        scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(
+                            min=cfg_renorm_min, max=1.0
+                        )
+                    else:
+                        # Multi-sample: per-sample scalar norms, broadcast
+                        # per-sample to each sample's token range.
+                        v_t_groups = list(v_t.split(per_sample_tok_counts, dim=0))
+                        v_t_groups_ = list(v_t_.split(per_sample_tok_counts, dim=0))
+                        scale_pieces = []
+                        for g_idx in range(len(per_sample_tok_counts)):
+                            ng = torch.norm(v_t_groups[g_idx])
+                            ng_ = torch.norm(v_t_groups_[g_idx])
+                            s = (ng / (ng_ + 1e-8)).clamp(
+                                min=cfg_renorm_min, max=1.0
+                            )
+                            # broadcast the scalar to this sample's row count
+                            scale_pieces.append(
+                                s.expand(per_sample_tok_counts[g_idx])
+                            )
+                        scale = torch.cat(scale_pieces, dim=0).unsqueeze(-1)
                 elif cfg_renorm_type == "channel":
                     norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
                     norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
+                    scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 else:
                     raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
-                scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_t = v_t_ * scale
         else:
             # No CFG
@@ -1049,6 +1130,7 @@ class Bagel(PreTrainedModel):
     ):
         step = 0
         generated_sequence = []
+        sampled_sequence = [] if return_log_probs else None
         token_log_probs = [] if return_log_probs else None
         curr_tokens = packed_start_tokens
         while step < max_length:
@@ -1093,9 +1175,12 @@ class Bagel(PreTrainedModel):
                 curr_tokens = torch.argmax(pred_logits, dim=-1)
 
             if return_log_probs:
+                # log-prob under the T=1 policy (so the importance ratio in
+                # GRPO is over the true policy, not the tempered sampler).
                 log_p = nn.functional.log_softmax(pred_logits, dim=-1)
                 selected_log_p = log_p.gather(1, curr_tokens.unsqueeze(1)).squeeze(1)
                 token_log_probs.append(selected_log_p)
+                sampled_sequence.append(curr_tokens)
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
@@ -1114,8 +1199,155 @@ class Bagel(PreTrainedModel):
         token_ids = torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
         if return_log_probs:
             log_probs_tensor = torch.stack([lp.to(output_device) for lp in token_log_probs], dim=0)
-            return token_ids, log_probs_tensor
+            sampled_ids = torch.stack([s.to(output_device) for s in sampled_sequence], dim=0)
+            # token_ids:    [bos, t_1, ..., t_{k-1}]   (the inputs fed to the LLM)
+            # sampled_ids:  [t_1, t_2, ..., t_k]       (what the LLM produced — 1-1 with log_probs)
+            # log_probs:    [log π(t_1 | bos), ..., log π(t_k | bos+t_1..t_{k-1})]
+            return token_ids, sampled_ids, log_probs_tensor
         return token_ids
+
+    @torch.no_grad
+    def generate_text_batched(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        end_token_id: int = None,
+    ):
+        """Batched packed-decode for B>1 samples sharing one NaiveCache.
+
+        Identical algorithm to `generate_text` (which is hardcoded B=1 on
+        the EOS check) but with **per-sample EOS tracking**: each sample
+        keeps generating until it independently emits `end_token_id`, then
+        is "frozen" (its sampled tokens are recorded but no longer count
+        toward the stopping condition). The whole batch stops once all B
+        samples have emitted EOS or `max_length` is reached.
+
+        After EOS, a frozen sample's subsequent positions in the cache are
+        junk — the caller is responsible for trimming each sample's cache
+        slice at its effective length via `NaiveCache.split(per_sample_lens)`.
+
+        Returns three lists of length B:
+          - per_sample_input_ids[b]:  the tokens that were FED to the LLM for sample b
+                                      (= [bos, t_1, ..., t_{k_b-1}], length k_b)
+          - per_sample_label_ids[b]:  the tokens the LLM SAMPLED for sample b
+                                      (= [t_1, ..., t_{k_b}], length k_b)
+          - per_sample_log_probs[b]:  T=1 log-probs of the sampled tokens
+                                      (= [log π(t_1|bos), ...], length k_b)
+        Plus:
+          - per_sample_effective_lens: [B] list of how many cache slots each
+            sample actually used (= prefix_len + k_b). Use this to drive
+            `NaiveCache.split` on the returned cache.
+
+        k_b is each sample's "decode steps" count (= the loop-step at which
+        sample b emitted EOS, +1 to include the EOS itself; or max_length
+        if it never did)."""
+        device = packed_start_tokens.device
+        B = key_values_lens.shape[0]
+
+        # Prefix length per sample at entry — needed to compute effective
+        # length later. Stays constant across the loop (the loop appends
+        # one cache slot per step per sample uniformly).
+        prefix_lens = key_values_lens.detach().clone().to(torch.long).tolist()
+
+        per_sample_inputs: list = [[] for _ in range(B)]
+        per_sample_labels: list = [[] for _ in range(B)]
+        per_sample_lps:    list = [[] for _ in range(B)]
+        eos_step: list = [None] * B  # the loop step at which sample b first emitted EOS
+
+        curr_tokens = packed_start_tokens  # [B]
+        step = 0
+        while step < max_length:
+            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0, len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] += i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            extra_inputs = {}
+            if self.use_moe:
+                extra_inputs = {"mode": "und"}
+
+            output = self.language_model.forward_inference(
+                packed_query_sequence=packed_text_embedding,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                **extra_inputs,
+            )
+            past_key_values = output.past_key_values
+            packed_query_sequence = output.packed_query_sequence
+            pred_logits = self.language_model.lm_head(packed_query_sequence)  # [B, V]
+
+            if do_sample:
+                probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
+                sampled = torch.multinomial(probs, num_samples=1).squeeze(1)  # [B]
+            else:
+                sampled = torch.argmax(pred_logits, dim=-1)  # [B]
+
+            # Log-prob under T=1 policy (for GRPO importance ratio).
+            log_p = nn.functional.log_softmax(pred_logits, dim=-1)
+            selected_log_p = log_p.gather(1, sampled.unsqueeze(1)).squeeze(1)  # [B]
+
+            # Per-sample bookkeeping. Samples that already emitted EOS are
+            # FROZEN: we don't append their later (junk) outputs.
+            sampled_cpu = sampled.detach().cpu().tolist()
+            curr_cpu    = curr_tokens.detach().cpu().tolist()
+            lp_cpu      = selected_log_p.detach().cpu().tolist()
+            for b in range(B):
+                if eos_step[b] is not None:
+                    continue
+                per_sample_inputs[b].append(curr_cpu[b])
+                per_sample_labels[b].append(sampled_cpu[b])
+                per_sample_lps[b].append(lp_cpu[b])
+                if end_token_id is not None and sampled_cpu[b] == end_token_id:
+                    eos_step[b] = step
+
+            # Stop when all samples have emitted EOS.
+            if end_token_id is not None and all(e is not None for e in eos_step):
+                step += 1
+                break
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            curr_tokens = sampled
+            step += 1
+
+        # Effective length per sample = prefix_lens[b] + k_b where k_b is
+        # the count of accepted (input, label, lp) triples for sample b.
+        per_sample_effective_lens = [
+            prefix_lens[b] + len(per_sample_labels[b]) for b in range(B)
+        ]
+        return (
+            per_sample_inputs,
+            per_sample_labels,
+            per_sample_lps,
+            per_sample_effective_lens,
+            past_key_values,
+        )
 
     # for evaluation
     @torch.no_grad()
