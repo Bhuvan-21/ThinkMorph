@@ -23,33 +23,35 @@ VIT_PATH="${VIT_PATH:-siglip-so400m-14-980-flash-attn2-navit}"
 
 # ── Data & output ─────────────────────────────────────────────────────────────
 DATASET_CONFIG="${DATASET_CONFIG:-data/configs/grpo_interleaved.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset}"
-CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset/checkpoints}"
+OUTPUT_DIR="${OUTPUT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset-graded-sharp-G8-lora-kl5}"
+CKPT_DIR="${CKPT_DIR:-/data/b-bsachdeva/thinkmorph-results/grpo-subset-graded-sharp-G8-lora-kl5/checkpoints}"
 RESUME_FROM="${RESUME_FROM:-}"
+AUTO_RESUME="${AUTO_RESUME:-False}"
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 WANDB_PROJECT="${WANDB_PROJECT:-thinkmorph-grpo-8xb200}"
-WANDB_NAME="${WANDB_NAME:-grpo-interleaved-optimized}"
+WANDB_NAME="${WANDB_NAME:-grpo-interleaved-graded-sharp-G8-lora-kl5}"
 WANDB_OFFLINE="${WANDB_OFFLINE:-false}"
 
 # ── GRPO hyperparameters ──────────────────────────────────────────────────────
-GROUP_SIZE="${GROUP_SIZE:-8}"
+GROUP_SIZE="${GROUP_SIZE:-8}"   # rollout batches over G; within-group advantage baseline
 CLIP_EPSILON="${CLIP_EPSILON:-0.2}"
-KL_WEIGHT="${KL_WEIGHT:-0.01}"
-REWARD_TYPE="${REWARD_TYPE:-exact_match}"
-TEMPERATURE="${TEMPERATURE:-0.9}"
+KL_WEIGHT="${KL_WEIGHT:-0.05}"   # k3 KL estimator; raised from 0.01 to curb reference drift
+REWARD_TYPE="${REWARD_TYPE:-graded_sharp}"   # 1.0 exact, else thin [0.1,0.5] partial: numeric tol 5% (numeric-equal→1.0), text near-binary (LCS≥0.85)
+IMAGE_SKIP_PENALTY="${IMAGE_SKIP_PENALTY:-0.1}"   # reward subtracted for generating 0 images (fights text-only collapse); 0 disables
+TEMPERATURE="${TEMPERATURE:-0.7}"
 MAX_THINK_TOKENS="${MAX_THINK_TOKENS:-8192}"
 MAX_ROUNDS="${MAX_ROUNDS:-3}"
 NUM_TIMESTEPS="${NUM_TIMESTEPS:-50}"
 LOG_SKIPPED="${LOG_SKIPPED:-true}"
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-TOTAL_STEPS="${TOTAL_STEPS:-1000}"
+TOTAL_STEPS="${TOTAL_STEPS:-2500}"
 WARMUP_STEPS="${WARMUP_STEPS:-50}"
 LR="${LR:-1e-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
-GRADIENT_ACCUM="${GRADIENT_ACCUM:-1}"
+GRADIENT_ACCUM="${GRADIENT_ACCUM:-1}"   # 2 prompts/rank/update → +prompt diversity, cuts cross-prompt gradient variance (free on memory; ~2× step wall-clock)
 
 # ── LoRA hyperparameters ──────────────────────────────────────────────────────
 LORA_R="${LORA_R:-64}"
@@ -102,6 +104,7 @@ torchrun \
   --clip_epsilon "${CLIP_EPSILON}" \
   --kl_weight "${KL_WEIGHT}" \
   --reward_type "${REWARD_TYPE}" \
+  --image_skip_penalty "${IMAGE_SKIP_PENALTY}" \
   --temperature "${TEMPERATURE}" \
   --max_think_tokens "${MAX_THINK_TOKENS}" \
   --max_rounds "${MAX_ROUNDS}" \
@@ -110,6 +113,7 @@ torchrun \
   \
   --results_dir "${OUTPUT_DIR}" \
   --checkpoint_dir "${CKPT_DIR}" \
+  --auto_resume "${AUTO_RESUME}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_name "${WANDB_NAME}" \
   ${WANDB_OFFLINE_ARG} \
@@ -121,12 +125,12 @@ torchrun \
   --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUM}" \
   --log_every 1 \
-  --save_every 200 \
+  --save_every 100 \
   \
   --lora_r "${LORA_R}" \
   --lora_alpha "${LORA_ALPHA}" \
   --lora_dropout "${LORA_DROPOUT}" \
   --lora_target_modules "${LORA_TARGET_MODULES}" \
-  --train_connector True \
-  --train_vae2llm True \
+  --train_connector False \
+  --train_vae2llm False \
   ${RESUME_ARG}

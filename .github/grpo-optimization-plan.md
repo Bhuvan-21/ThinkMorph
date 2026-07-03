@@ -64,10 +64,10 @@ to zero out the LoRA contribution during the ref forward — mathematically
 identical to "current weights == reference weights" because the reference
 *is* the SFT base (lora_B starts at zero by construction; we already assert
 this at snapshot time). No CPU traffic.
-**Risk:** If the user wants to support resuming from a step where the LoRA
-isn't zero (i.e., the SFT model + an old adapter), this breaks. The current
-code already snapshots BEFORE resume, so the invariant holds — but document
-this explicitly.
+**Resume invariant:** Resuming a GRPO checkpoint is safe as long as
+`MODEL_PATH` is the same SFT-merged base checkpoint used to start the run.
+The checkpoint reloads only the trainable LoRA/non-LoRA tensors; disabling the
+adapter for the reference forward still recovers the SFT base policy.
 
 ### 2.2 — Cache VAE latents and ViT patches in `RolloutSegment`
 **Location:** `train/grpo_packer.py` lines 116–150, 197–224

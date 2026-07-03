@@ -90,6 +90,19 @@ torchrun \
     [2025-05-25 17:01:45] (step=0000003) Train Loss mse: 0.3825, Train Loss ce: 0.7360, Train Steps/Sec: 0.44, 
     ```
 
+## GRPO LoRA resume
+
+`scripts/train_grpo_lora.sh` defaults `AUTO_RESUME=True`, so rerunning the
+same command with the same `CKPT_DIR` resumes the latest numeric checkpoint.
+Set `RESUME_FROM=/path/to/checkpoints/<step>` to choose a specific checkpoint,
+or `AUTO_RESUME=False` to force a fresh run.
+
+GRPO checkpoints restore LoRA weights, trainable non-LoRA weights, optimizer,
+scheduler, and `train_state.pt`. Newer checkpoints also save `data_status.pt`
+so the parquet iterator continues after the last consumed sample. Older GRPO
+checkpoints without `data_status.pt` remain load-compatible; they resume model
+and optimizer state but restart the dataset cursor.
+
 
 You are encouraged to adjust any of these hyperparameters to fit your GPU budget and the scale of your dataset. If you encounter any issues, please open an issue for assistance. 🎉
 

@@ -149,6 +149,13 @@ def build_grpo_dataset(
                 except Exception:
                     pass
 
+        group_data_status = None
+        if data_status is not None:
+            group_data_status = (
+                data_status.get(group_name, data_status)
+                if isinstance(data_status, dict) else data_status
+            )
+
         ds = GRPOIterableDataset(
             dataset_name=group_name,
             transform=transform,
@@ -160,7 +167,7 @@ def build_grpo_dataset(
             local_rank=local_rank,
             world_size=world_size,
             num_workers=num_workers,
-            data_status=data_status,
+            data_status=group_data_status,
         )
         datasets.append(ds)
 

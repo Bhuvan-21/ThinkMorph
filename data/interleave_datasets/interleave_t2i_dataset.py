@@ -165,9 +165,15 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
 
     def __iter__(self):
         file_paths_per_worker, worker_id = self.get_data_paths_per_worker()
+        worker_status = None
         if self.data_status is not None:
-            global_row_group_start_id = self.data_status[worker_id][0]
-            row_start_id = self.data_status[worker_id][1] + 1
+            if isinstance(self.data_status, dict):
+                worker_status = self.data_status.get(worker_id)
+            elif worker_id < len(self.data_status):
+                worker_status = self.data_status[worker_id]
+        if worker_status is not None:
+            global_row_group_start_id = worker_status[0]
+            row_start_id = worker_status[1] + 1
         else:
             global_row_group_start_id = 0
             row_start_id = 0

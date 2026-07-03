@@ -58,6 +58,32 @@ class Bagel(PreTrainedModel):
     config_class = BagelConfig
     base_model_prefix = 'bagel'
 
+    @staticmethod
+    def _mask_suppressed_token_logits(logits, suppress_token_ids):
+        if suppress_token_ids is None:
+            return logits
+
+        if not torch.is_tensor(suppress_token_ids):
+            if len(suppress_token_ids) == 0:
+                return logits
+            suppress_token_ids = torch.tensor(
+                suppress_token_ids, dtype=torch.long, device=logits.device
+            )
+        else:
+            if suppress_token_ids.numel() == 0:
+                return logits
+            suppress_token_ids = suppress_token_ids.to(device=logits.device, dtype=torch.long)
+
+        suppress_token_ids = suppress_token_ids[
+            (suppress_token_ids >= 0) & (suppress_token_ids < logits.shape[-1])
+        ]
+        if suppress_token_ids.numel() == 0:
+            return logits
+
+        logits = logits.clone()
+        logits.index_fill_(-1, suppress_token_ids, torch.finfo(logits.dtype).min)
+        return logits
+
     def __init__(self, language_model, vit_model, config: BagelConfig):
         super().__init__(config)    
         self.language_model = language_model
@@ -251,6 +277,7 @@ class Bagel(PreTrainedModel):
         packed_latent_position_ids: Optional[torch.LongTensor] = None,
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
+        suppress_token_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         """
         Compute per-token log-probabilities for the text tokens at ce_loss_indexes.
@@ -338,6 +365,7 @@ class Bagel(PreTrainedModel):
 
         # Compute log-probs at the CE loss positions
         logits = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
+        logits = self._mask_suppressed_token_logits(logits, suppress_token_ids)
         log_probs = F.log_softmax(logits, dim=-1)
         # Gather log-prob of the actual target token
         token_log_probs = log_probs.gather(1, packed_label_ids.unsqueeze(1)).squeeze(1)
@@ -1127,6 +1155,7 @@ class Bagel(PreTrainedModel):
         temperature: float = 1.0,
         end_token_id: int = None,
         return_log_probs: bool = False,
+        suppress_token_ids: Optional[torch.LongTensor] = None,
     ):
         step = 0
         generated_sequence = []
@@ -1167,6 +1196,7 @@ class Bagel(PreTrainedModel):
             past_key_values = output.past_key_values
             packed_query_sequence = output.packed_query_sequence
             pred_logits = self.language_model.lm_head(packed_query_sequence)
+            pred_logits = self._mask_suppressed_token_logits(pred_logits, suppress_token_ids)
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
@@ -1218,6 +1248,7 @@ class Bagel(PreTrainedModel):
         do_sample: bool = False,
         temperature: float = 1.0,
         end_token_id: int = None,
+        suppress_token_ids: Optional[torch.LongTensor] = None,
     ):
         """Batched packed-decode for B>1 samples sharing one NaiveCache.
 
@@ -1295,6 +1326,7 @@ class Bagel(PreTrainedModel):
             past_key_values = output.past_key_values
             packed_query_sequence = output.packed_query_sequence
             pred_logits = self.language_model.lm_head(packed_query_sequence)  # [B, V]
+            pred_logits = self._mask_suppressed_token_logits(pred_logits, suppress_token_ids)
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)

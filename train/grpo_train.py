@@ -49,7 +49,7 @@ from modeling.bagel import (
 from modeling.qwen2 import Qwen2Tokenizer
 from train.train_utils import create_logger, get_latest_ckpt
 from train.grpo_rewards import get_reward_fn
-from train.grpo_rollout import GRPORolloutGenerator
+from train.grpo_rollout import GRPORolloutGenerator, build_suppress_token_ids
 from train.grpo_loss import compute_grpo_loss, compute_advantages
 from train.grpo_packer import pack_rollout_for_log_probs
 from train.grpo_profiler import CudaPhaseTimer, make_profiler, format_phase_table
@@ -112,6 +112,11 @@ class GRPOArguments:
         metadata={"help": "KL penalty coefficient β."})
     reward_type: str = field(default="exact_match",
         metadata={"help": "Reward function name from REWARD_REGISTRY."})
+    image_skip_penalty: float = field(default=0.1,
+        metadata={"help": "Reward subtracted from a completion that generated zero images, "
+                          "to counteract collapse to text-only reasoning. Shapes the advantage "
+                          "reward only; exact_acc/reward_mean stay on the raw answer reward. "
+                          "0 disables."})
 
     # Rollout generation settings
     temperature: float = field(default=0.7,
@@ -231,7 +236,8 @@ def disable_lora_adapters(model):
 # Checkpoint helpers (reused from lora_finetune.py)
 # ---------------------------------------------------------------------------
 
-def save_grpo_checkpoint(step, model, optimizer, scheduler, checkpoint_dir, logger, rank):
+def save_grpo_checkpoint(step, model, optimizer, scheduler, checkpoint_dir, logger, rank,
+                         data_status=None):
     save_path = os.path.join(checkpoint_dir, f"{step:07d}")
     if rank == 0:
         os.makedirs(save_path, exist_ok=True)
@@ -252,6 +258,8 @@ def save_grpo_checkpoint(step, model, optimizer, scheduler, checkpoint_dir, logg
         torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
         torch.save(scheduler.state_dict(), os.path.join(save_path, "scheduler.pt"))
         torch.save({"step": step}, os.path.join(save_path, "train_state.pt"))
+        if data_status is not None:
+            torch.save(data_status, os.path.join(save_path, "data_status.pt"))
         logger.info(f"Checkpoint saved → {save_path}")
     if dist.is_initialized():
         dist.barrier()
@@ -259,7 +267,7 @@ def save_grpo_checkpoint(step, model, optimizer, scheduler, checkpoint_dir, logg
 
 def load_grpo_checkpoint(resume_from, model, optimizer, scheduler, logger):
     if resume_from is None or not os.path.isdir(resume_from):
-        return 0
+        return 0, None
     logger.info(f"Resuming from {resume_from}")
     unwrapped = model.module if isinstance(model, DDP) else model
     for fname in ["lora_weights.safetensors", "non_lora_params.safetensors"]:
@@ -274,10 +282,17 @@ def load_grpo_checkpoint(resume_from, model, optimizer, scheduler, logger):
     sch_path = os.path.join(resume_from, "scheduler.pt")
     if os.path.isfile(sch_path):
         scheduler.load_state_dict(torch.load(sch_path, map_location="cpu", weights_only=True))
+    data_status = None
+    data_status_path = os.path.join(resume_from, "data_status.pt")
+    if os.path.isfile(data_status_path):
+        data_status = torch.load(data_status_path, map_location="cpu", weights_only=True)
+        if isinstance(data_status, list):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            data_status = data_status[rank] if rank < len(data_status) else None
     state_path = os.path.join(resume_from, "train_state.pt")
     if os.path.isfile(state_path):
-        return torch.load(state_path, map_location="cpu", weights_only=True)["step"] + 1
-    return 0
+        return torch.load(state_path, map_location="cpu", weights_only=True)["step"] + 1, data_status
+    return 0, data_status
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +301,8 @@ def load_grpo_checkpoint(resume_from, model, optimizer, scheduler, logger):
 
 
 def compute_rollout_log_probs(
-    model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids, rollout
+    model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids, rollout,
+    suppress_token_ids=None,
 ):
     """
     Teacher-force the model over the rollout's *exact* sampled token IDs,
@@ -305,6 +321,8 @@ def compute_rollout_log_probs(
         vae_transform, vit_transform, new_token_ids,
     )
     num_gen_tokens = packed.pop("_num_gen_tokens")
+    if suppress_token_ids is not None:
+        packed["suppress_token_ids"] = suppress_token_ids
     log_probs = unwrapped.compute_text_log_probs(**packed)
     assert log_probs.shape[0] == num_gen_tokens, (
         f"log_probs has {log_probs.shape[0]} entries but expected {num_gen_tokens}"
@@ -610,7 +628,9 @@ def main():
     resume_from = training_args.resume_from
     if training_args.auto_resume and resume_from is None:
         resume_from = get_latest_ckpt(training_args.checkpoint_dir)
-    train_step = load_grpo_checkpoint(resume_from, model, optimizer, scheduler, logger)
+    train_step, data_status = load_grpo_checkpoint(
+        resume_from, model, optimizer, scheduler, logger
+    )
 
     # ── Dataset ──────────────────────────────────────────────────────────────
     with open(data_args.dataset_config_file, "r") as f:
@@ -622,6 +642,7 @@ def main():
         local_rank=rank,
         world_size=world_size,
         num_workers=data_args.num_workers,
+        data_status=data_status,
     )
     train_dataset.set_epoch(data_args.data_seed)
     train_loader = DataLoader(
@@ -635,11 +656,20 @@ def main():
 
     # ── Rollout generator & reward function ──────────────────────────────────
     unwrapped = model.module if isinstance(model, DDP) else model
+    lm_vocab_size = unwrapped.language_model.lm_head.weight.shape[0]
+    suppress_token_ids = build_suppress_token_ids(tokenizer, lm_vocab_size)
+    suppress_token_ids = torch.tensor(suppress_token_ids, dtype=torch.long, device=device)
+    if rank == 0 and suppress_token_ids.numel() > 0:
+        logger.info(
+            f"Suppressing {suppress_token_ids.numel()} non-decodable token IDs "
+            "during GRPO text generation and log-prob replay."
+        )
     vae_transform = ImageTransform(max_image_size=1024, min_image_size=512, image_stride=16)
     vit_xform = ImageTransform(max_image_size=518, min_image_size=224, image_stride=14)
     timer = CudaPhaseTimer(enabled=training_args.phase_timing)
     rollout_gen = GRPORolloutGenerator(
         unwrapped, vae_model, tokenizer, vae_transform, vit_xform, new_token_ids,
+        suppress_token_ids=suppress_token_ids,
         timer=timer,
     )
     reward_fn = get_reward_fn(grpo_args.reward_type)
@@ -685,6 +715,8 @@ def main():
         # Accumulators for logging across micro-steps
         accum_reward_sum = 0.0
         accum_reward_count = 0
+        accum_exact_sum = 0.0   # completions scoring a full 1.0 (exact match)
+        accum_image_sum = 0.0   # completions that generated >=1 image
         accum_policy_loss = 0.0
         accum_kl = 0.0
         accum_clip_frac = 0.0
@@ -708,6 +740,11 @@ def main():
             prompt = sample["prompt"][0]
             input_image = sample["input_image"][0] if "input_image" in sample else None
             gt_answer = sample["ground_truth"][0]
+            for item in sample.get("data_indexes", []):
+                if data_status is None:
+                    data_status = {}
+                dataset_status = data_status.setdefault(item["dataset_name"], {})
+                dataset_status[item["worker_id"]] = item["data_indexes"]
 
             # ── Phase 1: Rollout generation (no grad) ──────────────────
             model.eval()
@@ -731,30 +768,60 @@ def main():
 
             # Score completions
             rewards_list = []
+            img_counts = []
             for rollout in rollouts:
                 r = reward_fn(rollout.generated_text, gt_answer)
                 rewards_list.append(r)
+                n_img = len(rollout.generated_images)
+                img_counts.append(n_img)
                 rollout_text_lens.append(len(rollout.generated_token_ids))
                 rollout_round_counts.append(rollout.num_rounds)
-                rollout_image_counts.append(len(rollout.generated_images))
-            rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
-            advantages = compute_advantages(rewards)
+                rollout_image_counts.append(n_img)
 
-            accum_reward_sum += rewards.sum().item()
+            # Answer-only reward — what exact_acc / reward_mean track (kept raw and
+            # comparable across runs; the image penalty below does NOT touch these).
+            answer_rewards = torch.tensor(rewards_list, device=device, dtype=torch.float32)
+
+            # Reward shaping: subtract a small penalty from any completion that
+            # generated zero images, to fight collapse to text-only reasoning
+            # (the model learned to skip the <image_start> step since only the final
+            # answer was scored). Applied to the advantage reward only. Bonus side
+            # effect: in an all-correct group where some completions imaged and some
+            # didn't, the shaped reward now varies → the group is no longer skipped
+            # and the gradient actively pushes the policy back toward imaging.
+            #
+            # Gated on a non-zero answer reward: we only encourage imaging in service
+            # of a (at least partly) correct answer, never on already-wrong completions
+            # — so the penalty can't push reward negative or reward "image then miss".
+            no_image = torch.tensor(
+                [1.0 if c == 0 else 0.0 for c in img_counts], device=device, dtype=torch.float32
+            )
+            penalize = (answer_rewards > 1e-6).float()
+            train_rewards = answer_rewards - grpo_args.image_skip_penalty * no_image * penalize
+            advantages = compute_advantages(train_rewards)
+
+            accum_reward_sum += answer_rewards.sum().item()
             accum_reward_count += len(rewards_list)
+            # Exact-match accuracy: count completions at full reward. Tracked over
+            # ALL completions (incl. skipped all-identical groups) so it reflects
+            # true correctness, not the partial-credit-inflated reward_mean.
+            accum_exact_sum += (answer_rewards >= 1.0 - 1e-6).sum().item()
+            # Image rate: fraction of completions that generated >=1 image — watch
+            # this to confirm the penalty is reviving image generation.
+            accum_image_sum += sum(1 for c in img_counts if c > 0)
 
-            # Skip if all rewards are identical (no signal)
-            if rewards.std() < 1e-8:
+            # Skip if all (shaped) rewards are identical (no signal)
+            if train_rewards.std() < 1e-8:
                 logger.info(
                     f"(step={curr_step:07d} micro={micro}) Skipping — all rewards identical "
-                    f"(mean={rewards.mean().item():.3f})"
+                    f"(mean={answer_rewards.mean().item():.3f})"
                 )
                 if grpo_args.log_skipped_responses:
                     logger.info(f"  Prompt: {prompt}")
                     logger.info(f"  GT answer: {gt_answer}")
                     for g_idx, rollout in enumerate(rollouts):
                         resp = rollout.generated_text
-                        logger.info(f"  [G={g_idx}] r={rewards_list[g_idx]:.1f} | {resp}")
+                        logger.info(f"  [G={g_idx}] r={rewards_list[g_idx]:.2f} | {resp}")
                 accum_skipped += 1
                 continue
 
@@ -784,6 +851,7 @@ def main():
                             curr_lps = compute_rollout_log_probs(
                                 model, vae_model, tokenizer,
                                 vae_transform, vit_xform, new_token_ids, rollout,
+                                suppress_token_ids=suppress_token_ids,
                             )
                 except Exception as e:
                     import traceback
@@ -827,6 +895,7 @@ def main():
                             ref_lps = compute_rollout_log_probs(
                                 model, vae_model, tokenizer,
                                 vae_transform, vit_xform, new_token_ids, rollout,
+                                suppress_token_ids=suppress_token_ids,
                             )
                 except Exception as e:
                     import traceback
@@ -916,6 +985,8 @@ def main():
             # not just rank 0's local view.
             g_reward_sum   = accum_reward_sum
             g_reward_count = accum_reward_count
+            g_exact_sum    = accum_exact_sum
+            g_image_sum    = accum_image_sum
             g_policy_loss  = accum_policy_loss
             g_kl           = accum_kl
             g_clip_frac    = accum_clip_frac
@@ -923,13 +994,13 @@ def main():
             g_skipped      = accum_skipped
             if world_size > 1:
                 t = torch.tensor(
-                    [g_reward_sum, float(g_reward_count),
+                    [g_reward_sum, float(g_reward_count), g_exact_sum, g_image_sum,
                      g_policy_loss, g_kl, g_clip_frac,
                      float(g_completions), float(g_skipped)],
                     device=device, dtype=torch.float64,
                 )
                 dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                (g_reward_sum, g_reward_count_f,
+                (g_reward_sum, g_reward_count_f, g_exact_sum, g_image_sum,
                  g_policy_loss, g_kl, g_clip_frac,
                  g_completions_f, g_skipped_f) = t.tolist()
                 g_reward_count = int(g_reward_count_f)
@@ -938,9 +1009,13 @@ def main():
 
             n = max(g_completions, 1)
             r_mean = g_reward_sum / max(g_reward_count, 1)
+            exact_acc = g_exact_sum / max(g_reward_count, 1)
+            img_rate = g_image_sum / max(g_reward_count, 1)
             msg = (
                 f"(step={curr_step:07d}) "
                 f"reward_mean: {r_mean:.3f}, "
+                f"exact_acc: {exact_acc:.3f}, "
+                f"img_rate: {img_rate:.3f}, "
                 f"policy_loss: {g_policy_loss/n:.4f}, "
                 f"kl: {g_kl/n:.4f}, "
                 f"clip_frac: {g_clip_frac/n:.3f}, "
@@ -974,6 +1049,8 @@ def main():
             if rank == 0:
                 log_dict = {
                     "reward_mean": r_mean,
+                    "exact_acc": exact_acc,
+                    "img_rate": img_rate,
                     "policy_loss": g_policy_loss / n,
                     "kl_divergence": g_kl / n,
                     "clip_fraction": g_clip_frac / n,
@@ -996,9 +1073,15 @@ def main():
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         if curr_step > 0 and curr_step % training_args.save_every == 0:
+            if dist.is_initialized():
+                gather_list = [None] * world_size if rank == 0 else None
+                dist.gather_object(data_status, gather_list, dst=0)
+            else:
+                gather_list = data_status
             save_grpo_checkpoint(
                 curr_step, model, optimizer, scheduler,
                 training_args.checkpoint_dir, logger, rank,
+                data_status=gather_list,
             )
 
         # Early-exit once the profiler has captured all `active` steps. The
@@ -1020,9 +1103,15 @@ def main():
 
     if not profiling_active:
         # Final checkpoint
+        if dist.is_initialized():
+            gather_list = [None] * world_size if rank == 0 else None
+            dist.gather_object(data_status, gather_list, dst=0)
+        else:
+            gather_list = data_status
         save_grpo_checkpoint(
             training_args.total_steps, model, optimizer, scheduler,
             training_args.checkpoint_dir, logger, rank,
+            data_status=gather_list,
         )
     logger.info("GRPO+LoRA training complete.")
     if rank == 0:

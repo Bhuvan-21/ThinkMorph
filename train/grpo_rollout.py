@@ -21,6 +21,12 @@ from inferencer import InterleaveInferencer, VLM_THINK_SYSTEM_PROMPT, GEN_THINK_
 from modeling.bagel.qwen2_navit import NaiveCache as NaiveCacheCls
 
 
+def build_suppress_token_ids(tokenizer, vocab_size: int) -> List[int]:
+    token_ids = list(range(int(vocab_size)))
+    tokens = tokenizer.convert_ids_to_tokens(token_ids)
+    return [token_id for token_id, token in zip(token_ids, tokens) if token is None]
+
+
 @dataclass
 class RolloutSegment:
     """One span in the chronological rollout sequence.
@@ -89,6 +95,7 @@ class GRPORolloutGenerator:
         vae_transform,
         vit_transform,
         new_token_ids,
+        suppress_token_ids=None,
         timer=None,
     ):
         self.model = model
@@ -101,6 +108,16 @@ class GRPORolloutGenerator:
             model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids
         )
         self._device = next(model.parameters()).device
+        if suppress_token_ids is None:
+            self.suppress_token_ids = None
+        elif torch.is_tensor(suppress_token_ids):
+            self.suppress_token_ids = suppress_token_ids.to(self._device, dtype=torch.long)
+        else:
+            self.suppress_token_ids = torch.tensor(
+                suppress_token_ids, dtype=torch.long, device=self._device
+            )
+        if self.suppress_token_ids is not None and self.suppress_token_ids.numel() == 0:
+            self.suppress_token_ids = None
 
         # Optional CudaPhaseTimer. A no-op shim is used when None so we can
         # leave `with self._timer.time(...)` in the hot path unconditionally.
@@ -170,6 +187,7 @@ class GRPORolloutGenerator:
             temperature=temperature,
             end_token_id=self.new_token_ids['eos_token_id'],
             return_log_probs=True,
+            suppress_token_ids=self.suppress_token_ids,
             **generation_input,
         )
 
@@ -236,6 +254,7 @@ class GRPORolloutGenerator:
             do_sample=do_sample,
             temperature=temperature,
             end_token_id=self.new_token_ids['eos_token_id'],
+            suppress_token_ids=self.suppress_token_ids,
             **gen_input,
         )
         del scratch_cache, _scratch_after

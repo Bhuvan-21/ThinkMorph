@@ -44,8 +44,11 @@ def compute_grpo_loss(
     surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
     policy_loss = -torch.min(surr1, surr2)
 
-    # Approximate KL: E_π_θ[log π_θ - log π_ref]
-    kl = current_log_probs - ref_log_probs
+    # KL penalty via Schulman's k3 estimator: exp(ref - cur) - (ref - cur) - 1.
+    # Always non-negative and lower-variance than the raw (cur - ref) difference,
+    # which can go negative and was letting the policy drift from the reference.
+    ref_minus_cur = ref_log_probs - current_log_probs
+    kl = torch.exp(ref_minus_cur) - ref_minus_cur - 1.0
     kl_loss = kl_weight * kl
 
     # Combined per-token loss
